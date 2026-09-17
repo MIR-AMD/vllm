@@ -473,7 +473,7 @@ class MoRIIOWriter:
         if _dp_local > 0:
             _decode_dp_rank_for_port = _decode_dp_rank_for_port % _dp_local
         remote_port = remote_notify_port + get_port_offset(
-            _decode_dp_rank_for_port, self.worker.tp_rank
+            _decode_dp_rank_for_port, self.worker.tp_rank, self.worker.world_size
         )
         # Consider using RDMA immediate data in decode side
         # to eliminate the need for this notification.

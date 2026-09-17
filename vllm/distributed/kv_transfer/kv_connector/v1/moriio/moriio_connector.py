@@ -407,27 +407,61 @@ class MoRIIOConnectorScheduler:
             )
         )
         if self._is_hma_required:
-            # TODO(simondanielsson): support non-sliding window hybrids
+            from vllm.v1.kv_cache_interface import MambaSpec
+
+            # Full-allocation hybrid groups (linear-attention Mamba / gated-delta
+            # / KDA recurrent state, and MLA / packed indexer caches) are NEVER
+            # clipped: they allocate blocks for the whole sequence and their
+            # blocks_per_sw is 0, exactly like a FullAttentionSpec group. Only
+            # SlidingWindowSpec groups are clipped, and only that clipping is
+            # what the WRITE-mode / non-sliding-window TODOs below were about.
+            # GLM-5.3-Flash (Mamba + MLA + DSA indexer) requires HMA -- stock
+            # vLLM core cannot unify its heterogeneous specs without it (a
+            # --disable-hybrid-kv-cache-manager run fails in
+            # unify_hybrid_kv_cache_specs) -- so treat these full-allocation
+            # specs as supported and reserve the guards for genuinely-clipped
+            # sliding-window groups.
+            _full_alloc = (FullAttentionSpec, MambaSpec)
             unsupported = [
                 type(g.kv_cache_spec).__name__
                 for g in kv_cache_config.kv_cache_groups
                 if not isinstance(
-                    g.kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)
+                    g.kv_cache_spec, (_full_alloc + (SlidingWindowSpec,))
                 )
             ]
             if unsupported:
                 raise NotImplementedError(
-                    "MoRIIO only supports sliding-window hybrid models (e.g. "
-                    "Gemma) under the hybrid KV cache manager. Unsupported KV "
-                    f"cache group spec(s): {sorted(set(unsupported))}. Pass "
-                    "--disable-hybrid-kv-cache-manager to run without HMA."
+                    "MoRIIO only supports sliding-window and full-allocation "
+                    "hybrid models under the hybrid KV cache manager. "
+                    f"Unsupported KV cache group spec(s): {sorted(set(unsupported))}. "
+                    "Pass --disable-hybrid-kv-cache-manager to run without HMA."
                 )
-            if self.mode == MoRIIOMode.WRITE:
-                # TODO(simondanielsson): support HMA in WRITE mode
+            _has_sliding_window = any(
+                isinstance(g.kv_cache_spec, SlidingWindowSpec)
+                for g in kv_cache_config.kv_cache_groups
+            )
+            _defer_writes = os.environ.get("MORIIO_DEFER_WRITES") == "1"
+            if self.mode == MoRIIOMode.WRITE and _has_sliding_window and (
+                not _defer_writes
+            ):
+                # WRITE-mode last-chunk clipping is only unsupported for
+                # sliding-window groups; full-allocation Mamba/MLA hybrids are
+                # never clipped, so WRITE mode is safe for them. For the
+                # sliding-window group (GLM-5.3-Flash's KpoolTail, window=4) a
+                # naive in-forward write ships KV that the model is still
+                # rotating -> CORRUPT disagg recall (colocated gives "Paris",
+                # naive WRITE-mode disagg gives garbage). MORIIO_DEFER_WRITES=1
+                # defers all per-layer writes to the post-forward flush
+                # (wait_for_save), after the sliding-window KV has settled, so
+                # WRITE mode is correct; permit it in that case. Without the
+                # defer gate, keep rejecting so users are not silently exposed
+                # to the corruption (use READ mode, MORIIO_DEFER_WRITES=1, or
+                # --disable-hybrid-kv-cache-manager).
                 raise NotImplementedError(
-                    "MoRIIO WRITE mode does not support hybrid KV cache groups "
-                    "(sliding-window attention). Use READ mode, or pass "
-                    "--disable-hybrid-kv-cache-manager."
+                    "MoRIIO WRITE mode does not support sliding-window hybrid KV "
+                    "cache groups unless MORIIO_DEFER_WRITES=1 (deferred "
+                    "post-forward writes). Set MORIIO_DEFER_WRITES=1, use READ "
+                    "mode, or pass --disable-hybrid-kv-cache-manager."
                 )
 
         sw_sizes_tokens: list[tuple[int, int]] = [
@@ -687,7 +721,9 @@ class MoRIIOConnectorScheduler:
 
         remote_notify_port = int(remote_notify_port)
         for tp_index in range(self.tp_size):
-            target_port = remote_notify_port + get_port_offset(remote_dp_rank, tp_index)
+            target_port = remote_notify_port + get_port_offset(
+                remote_dp_rank, tp_index, self.tp_size
+            )
             self._send_transfer_release(transfer_id, remote_host, target_port)
 
     def update_state_after_alloc(
@@ -889,7 +925,7 @@ class MoRIIOConnectorScheduler:
                             _notify_host = _remote_hosts[_pod_idx]
                     for tp_index in range(self.tp_size):
                         target_port = remote_notify_port + get_port_offset(
-                            _remote_dp_rank_for_port, tp_index
+                            _remote_dp_rank_for_port, tp_index, self.tp_size
                         )
 
                         self.send_notify_block(
@@ -1330,7 +1366,11 @@ class MoRIIOConnectorWorker:
 
         self.side_channel_port: int = (
             self.moriio_config.handshake_port
-            + get_port_offset(self.dp_rank, self.tp_rank)
+            + get_port_offset(
+                self.dp_rank,
+                self.tp_rank,
+                get_tensor_model_parallel_world_size(),
+            )
         )
         self.engine_id: EngineId = engine_id
 
@@ -1341,6 +1381,12 @@ class MoRIIOConnectorWorker:
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.kv_layer_mr_offset: dict[str, int] = {}
         self.layer_base_addr_index: dict[str, int] = {}
+
+        # Set only while wait_for_save() is flushing the deferred per-layer
+        # writes (see save_kv_layer / MORIIO_DEFER_WRITES). Lets the deferred
+        # save_kv_layer gate distinguish an in-forward call (skip) from the
+        # post-forward flush (perform the writes).
+        self._flushing_saves: bool = False
 
         # Map of engine_id -> kv_caches_base_addr. For TP case, each local
         # rank will still only pull from a single remote TP worker.
@@ -1791,6 +1837,14 @@ class MoRIIOConnectorWorker:
     def _is_mla_cache_layer(self, layer_name: str) -> bool:
         return is_mla_cache_layer(self.layer_to_spec, layer_name)
 
+    def _is_indexer_skip_layer(self, layer_name: str) -> bool:
+        # Opt-in (INDEXER_SKIP=1): skip cross-node transfer of the DSA sparse
+        # indexer k_cache layers, which the decode leg recomputes locally.
+        # Disabled by default so behavior is unchanged unless requested.
+        if os.environ.get("INDEXER_SKIP", "0") != "1":
+            return False
+        return ".indexer." in layer_name
+
     def _get_layer_transfer_geometry(
         self, layer_name: str, remote_num_blocks: int | None = None
     ) -> LayerTransferGeometry:
@@ -1921,19 +1975,38 @@ class MoRIIOConnectorWorker:
             self.layer_base_addr_index[layer_name] = base_addr_idx
             geometry = self._get_layer_transfer_geometry(layer_name)
             if hma_enabled:
-                if geometry.block_len != self.block_len:
-                    raise ValueError(
-                        "MoRIIO KV cache block length mismatch for layer "
-                        f"{layer_name}: {geometry.block_len} != {self.block_len}"
-                    )
+                # Hybrid models (e.g. GLM-5.3-Flash: Mamba/KDA linear-attention
+                # state layers interleaved with MLA attention layers) carry
+                # legitimately different per-layer block lengths (state page vs.
+                # latent page). Transfer offsets are computed per layer from
+                # each layer's own geometry, and the heterogeneous layers share
+                # one MR with per-layer offsets in ``kv_layer_mr_offset``, so a
+                # non-uniform block_len is correct here. The advertised scalar
+                # ``self.block_len`` is metadata only and never drives transfer
+                # math on either side, so record the per-layer value instead of
+                # forcing uniformity. ``num_blocks`` below is still required to
+                # be uniform because it is advertised as a single scalar and
+                # reused as ``remote_num_blocks`` for every layer.
+                pass
             elif geometry.block_size != self.block_size:
                 raise ValueError(
                     "MoRIIO KV cache block size mismatch for layer "
                     f"{layer_name}: {geometry.block_size} != {self.block_size}"
                 )
-            # num_blocks is advertised as a single scalar to the peer, so must it
-            # be uniform
-            if geometry.num_blocks != self.num_blocks:
+            # num_blocks is advertised as a single scalar to the peer and reused
+            # as ``remote_num_blocks`` ONLY by the split-KV dense path
+            # (transfers_per_block == 2, via remote_kv_stride). Single-region
+            # layers (transfers_per_block == 1: MLA latent, the DSA sparse
+            # indexer k_cache, and Mamba/KDA state) never consume it — their
+            # per-layer offsets come from per-group block_ids and per-layer base
+            # addresses. Hybrid models legitimately give each KV cache group a
+            # different block count (e.g. GLM-5.3-Flash: main group 4717 blocks
+            # vs. sparse-indexer group 42453 blocks), so only enforce uniformity
+            # for the split-KV layers that actually rely on the advertised
+            # scalar.
+            if geometry.transfers_per_block == 2 and (
+                geometry.num_blocks != self.num_blocks
+            ):
                 raise ValueError(
                     "MoRIIO KV cache num_blocks mismatch for layer "
                     f"{layer_name}: {geometry.num_blocks} != {self.num_blocks}"
@@ -2220,6 +2293,27 @@ class MoRIIOConnectorWorker:
             return
         if self.mode == MoRIIOMode.READ:
             return
+        if self._is_indexer_skip_layer(layer_name):
+            return
+        # MORIIO_DEFER_WRITES=1: defer the per-layer RDMA writes out of the
+        # forward pass. GLM-5.3-Flash's KpoolTail sliding-window (KDA indexer
+        # k-pool tail, window=4) KV is still being produced/rotated while later
+        # layers run, so issuing the RDMA batch_write for it mid-forward races
+        # the model's own writes and ships stale/torn bytes -> the decode leg
+        # reads corrupt KV and long-range recall is garbage ("Japanese bank"
+        # instead of "Paris"). When gated on, skip every in-forward write
+        # (attn_metadata is not None) and let wait_for_save() flush all layers
+        # once the full forward has completed (_flushing_saves set,
+        # attn_metadata None) -> no compute/RDMA overlap, correct handoff.
+        # MORIIO_NO_WRITE=1 disables producer writes entirely (debug only).
+        if os.environ.get("MORIIO_NO_WRITE") == "1":
+            return
+        if (
+            os.environ.get("MORIIO_DEFER_WRITES") == "1"
+            and attn_metadata is not None
+            and not self._flushing_saves
+        ):
+            return
         remote_engine_id = None
 
         for req_id, meta in metadata.reqs_to_save.items():
@@ -2503,10 +2597,62 @@ class MoRIIOConnectorWorker:
         self._reqs_to_send.update(metadata.reqs_to_send)
 
     def wait_for_save(self, metadata: MoRIIOConnectorMetadata):
+        if os.environ.get("MORIIO_NO_WRITE") == "1":
+            return
         if self.mode == MoRIIOMode.WRITE and self.is_producer:
-            for layer_name, kv_layer in self.kv_caches.items():
-                self.save_kv_layer(metadata, layer_name, kv_layer, None)
+            # When MORIIO_DEFER_WRITES=1, save_kv_layer skipped every write
+            # during the forward; do them all now (attn_metadata=None), after
+            # the full forward has completed, so no RDMA overlaps compute.
+            # _flushing_saves lets the deferred gate know this is the flush.
+            self._flushing_saves = True
+            try:
+                for layer_name, kv_layer in self.kv_caches.items():
+                    self.save_kv_layer(metadata, layer_name, kv_layer, None)
+            finally:
+                self._flushing_saves = False
             self._writer.seal_pending_transfers()
+            if os.environ.get("MORIIO_DEFER_WRITES") == "1":
+                self._restore_ctx_after_transfer()
+
+    def _restore_ctx_after_transfer(self) -> None:
+        """Re-assert the HIP primary context after a mori transfer flush (ROCm).
+
+        mori's transfer path (CreateSession / BatchWrite / RegisterMemory)
+        leaves this thread's HIP primary context in a state where Triton's
+        load_binary (_init_handles) fails with HIP-209 "no kernel image" on the
+        next multi-block prefill (the DSA indexer chunk-metadata kernel).
+        Rebind the primary context current (set_device -> hipSetDevice, plus a
+        tiny device op to force it live), then clear each cached JITFunction's
+        in-process device handles so the next launch reloads the module into the
+        restored context instead of reusing a handle bound to the dead one. The
+        compiled .so stays on disk; only the in-memory handle is recreated.
+        """
+        try:
+            import torch as _torch
+
+            if _torch.cuda.is_available():
+                _dev = _torch.cuda.current_device()
+                _torch.cuda.set_device(_dev)
+                _torch.cuda.synchronize(_dev)
+        except Exception:
+            logger.debug("MoRIIO post-transfer HIP ctx restore skipped", exc_info=True)
+        try:
+            import gc as _gc
+
+            import triton as _triton
+
+            jit_fn = _triton.runtime.jit.JITFunction
+            for obj in _gc.get_objects():
+                try:
+                    if isinstance(obj, jit_fn):
+                        device_caches = getattr(obj, "device_caches", None)
+                        if device_caches:
+                            device_caches.clear()
+                except Exception:
+                    pass
+        except Exception:
+            logger.debug("MoRIIO post-transfer Triton cache clear skipped",
+                         exc_info=True)
 
     def _next_flex_tp_rank(self, remote_tp_size: int) -> int:
         """Deterministic round-robin over prefill tp0..N-1 for the flexible read.

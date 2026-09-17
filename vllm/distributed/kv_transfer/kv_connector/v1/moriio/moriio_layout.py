@@ -231,6 +231,50 @@ def get_layer_transfer_geometry(
             split_kv_regions=False,
         )
 
+    if len(shape) == 4 and shape[1] == 1:
+        # Single-head-slot packed 4-D cache fallback for hybrid / packed caches
+        # whose physical [B, H=1, N, C] layout the standardized branch above
+        # rejects. Two such caches occur in GLM-5.3-Flash / DeepSeek-V3.2 DSA on
+        # ROCm, and the earlier standardized branch fails on each for a reason
+        # unrelated to the actual byte layout:
+        #   * the sparse-indexer k_cache, e.g. shape (42453, 1, 32, 132),
+        #     stride (4224, 132, 132, 1), MLAAttentionSpec whose *logical*
+        #     num_states (288) != the physically packed shape[2] (32), so
+        #     ``shape[2] == spec.num_states`` fails; and
+        #   * the linear-attention (Mamba / gated-delta / KDA) recurrent-state
+        #     cache, e.g. shape (4717, 1, 1, 1085440), stride
+        #     (1179648, 1085440, 1085440, 1), a non-AttentionSpec MambaSpec
+        #     whose page is padded (here by 8.68%, so stride[0] > prod(shape[1:]))
+        #     to match the attention page, and which the AttentionSpec-typed
+        #     branch never matches at all.
+        # Both are one contiguous (optionally padded) region per block, so
+        # transfer the meaningful bytes per block over the natural block stride:
+        # block_len counts only the real per-block content (prod(shape[1:]))
+        # while block_stride keeps the padded stride[0] so per-block offsets and
+        # the registered span both skip the inter-block padding. This is
+        # byte-identical to the standardized [B, H, N, C] branch for an
+        # unpadded, spec-matching MLA tensor, so it is a safe superset.
+        # ``shape[1] == 1`` (single head slot) is the structural gate: genuine
+        # dense K/V caches that need two regions / split-KV transfers are 5-D
+        # (shape[0] == 2 or shape[1] == 2) and are handled above, never reaching
+        # here; real multi-head [B, H>1, N, C] MLA also matches the standardized
+        # branch above first.
+        num_blocks = shape[0]
+        slot_size_bytes = shape[2] * shape[3] * element_size
+        block_len = shape[1] * slot_size_bytes
+        return LayerTransferGeometry(
+            num_blocks=num_blocks,
+            block_size=spec.block_size,
+            block_len=block_len,
+            slot_size_bytes=slot_size_bytes,
+            block_stride=stride[0],
+            local_kv_stride=None,
+            remote_kv_stride=None,
+            transfers_per_block=1,
+            regions_per_block=1,
+            split_kv_regions=False,
+        )
+
     cache_kind = "MLA" if is_mla_cache else "K/V"
     raise ValueError(
         f"Unsupported MoRIIO {cache_kind} cache shape for layer "

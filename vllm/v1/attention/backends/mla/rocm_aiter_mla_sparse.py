@@ -809,6 +809,19 @@ class ROCMAiterMLASparseImpl(
             (q_concat_shape, vllm_config.model_config.dtype),
         )
 
+    def record_logical_topk_ready(self) -> None:
+        # Sparse MLA in mla.py unconditionally calls this hook after the indexer
+        # runs. On CUDA (SparseMLACommonImpl) it records a CUDA event so an
+        # async side-stream can convert logical->physical top-k for all layers
+        # in the index group. The ROCm AITER sparse impl instead resolves top-k
+        # inline on the main stream in forward_mqa (via
+        # triton_convert_req_index_to_global_index) and builds no index group /
+        # side stream, so there is no event to record and no work to defer here.
+        # A guarded no-op mirrors the common impl behavior when index_group is
+        # None; it must exist because ROCMAiterMLASparseImpl only inherits the
+        # bare SharedTopkIndicesBuffer mixin (not SparseMLACommonImpl).
+        return None
+
     def _forward_mla(
         self,
         layer: AttentionLayer,
