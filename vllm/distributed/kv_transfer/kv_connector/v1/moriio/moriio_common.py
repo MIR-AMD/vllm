@@ -84,6 +84,13 @@ class RemoteAllocInfo:
     """Information about remote block allocation."""
 
     block_ids: list[int]
+    # Per-group remote (decode) block ids for hybrid multi-group KV models
+    # (GLM-5.3-Flash: MLA full-attn / KpoolTail sliding-window / Mamba-KDA
+    # recurrent). ``block_ids`` above is group 0 only (back-compat); this list
+    # holds every group's blocks so the producer WRITE can route each layer to
+    # the correct remote group. None for legacy single-group models -> the
+    # write path falls back to ``block_ids``.
+    all_group_block_ids: list[list[int]] | None = None
     writes_done: int = 0
     writes_expected: int | None = None
     decode_dp_rank: int = 0

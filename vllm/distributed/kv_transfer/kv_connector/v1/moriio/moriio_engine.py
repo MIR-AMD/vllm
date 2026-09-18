@@ -380,10 +380,22 @@ class MoRIIOWriter:
         key = (task.layer_name, *_get_write_geometry_key(layer_cache))
         offsets = request_info.transfer_offsets.get(key)
         if offsets is None:
+            # Route this layer's WRITE to the correct remote KV group.
+            # task.local_block_ids is already this layer's group (set in
+            # _write_blocks_for_req); the remote destination must match. For
+            # hybrid multi-group models the decode leg advertised every group's
+            # blocks via all_group_block_ids -- pick this layer's group.
+            # Falls back to block_ids (group 0) for legacy single-group peers.
+            _agl = request_info.all_group_block_ids
+            _gidx = self.worker.layer_to_group.get(task.layer_name, 0)
+            if _agl is not None and 0 <= _gidx < len(_agl):
+                remote_block_ids = _agl[_gidx]
+            else:
+                remote_block_ids = request_info.block_ids
             offsets = self.worker._compute_block_transfer_offsets(
                 task.layer_name,
                 task.local_block_ids,
-                request_info.block_ids,
+                remote_block_ids,
                 remote_moriio_meta,
                 remote_engine_id=task.dst_engine_id,
             )
@@ -775,6 +787,10 @@ class MoRIIOWrapper:
         assert get_role() == ROLE.PRODUCER, "Only prefill can get block messages"
         transfer_id = data["transfer_id"]
         block_notify_list = data.get("block_notify_list", [])
+        # Per-group decode blocks for hybrid multi-group KV (GLM-5.3-Flash).
+        # None on legacy single-group peers -> write path falls back to
+        # block_notify_list (group 0) for every layer.
+        all_group_block_notify = data.get("all_group_block_notify")
         decode_dp_rank = data.get("decode_rank", 0)
         if not block_notify_list:
             raise MoRIIOError(
@@ -789,7 +805,9 @@ class MoRIIOWrapper:
                 )
                 return
             self.done_remote_allocate_req_dict[transfer_id] = RemoteAllocInfo(
-                block_ids=block_notify_list, decode_dp_rank=decode_dp_rank
+                block_ids=block_notify_list,
+                all_group_block_ids=all_group_block_notify,
+                decode_dp_rank=decode_dp_rank,
             )
 
     def _handle_write_done_message(self, data: dict):

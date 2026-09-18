@@ -643,6 +643,7 @@ class MoRIIOConnectorScheduler:
         req_id: ReqId,
         transfer_id: TransferId,
         block_notify_list: list[int],
+        all_group_block_notify=None,
         host=None,
         port=None,
     ):
@@ -658,6 +659,10 @@ class MoRIIOConnectorScheduler:
             "req_id": req_id,
             "transfer_id": transfer_id,
             "block_notify_list": block_notify_list or [],
+            # Per-group decode blocks for hybrid multi-group KV (GLM-5.3-Flash).
+            # None -> legacy single-group peer; producer falls back to
+            # block_notify_list (group 0). See RemoteAllocInfo.all_group_block_ids.
+            "all_group_block_notify": all_group_block_notify,
             # GLOBAL decode dp rank: producer derives the per-pod notify offset
             # (% dp_local), owning pod index (// dp_local), and write-target
             # from it. Sending the LOCAL rank made child-pod consumers look
@@ -901,8 +906,19 @@ class MoRIIOConnectorScheduler:
 
                     # num_external_tokens == 0: nothing to push, so don't tell
                     # the producer to write into these blocks.
+                    # block_notify_list keeps advertising group 0 only (legacy
+                    # single-group wire); all_group_block_notify carries EVERY
+                    # KV group's decode blocks so the producer can route each
+                    # layer's WRITE to the correct remote group (GLM-5.3-Flash
+                    # hybrid KV). None when there is nothing to push.
+                    _notify_all_gids = blocks.get_block_ids()
                     block_notify_list = (
-                        blocks.get_block_ids()[0] if num_external_tokens > 0 else []
+                        _notify_all_gids[0] if num_external_tokens > 0 else []
+                    )
+                    all_group_block_notify = (
+                        [list(g) for g in _notify_all_gids]
+                        if num_external_tokens > 0
+                        else None
                     )
 
                     # Wide-EP multi-pod: a pod binds notify sockets only for
@@ -932,6 +948,7 @@ class MoRIIOConnectorScheduler:
                             req_id=request.request_id,
                             transfer_id=request.kv_transfer_params["transfer_id"],
                             block_notify_list=block_notify_list,
+                            all_group_block_notify=all_group_block_notify,
                             host=_notify_host,
                             port=target_port,
                         )
@@ -2728,10 +2745,27 @@ class MoRIIOConnectorWorker:
             self.remote_dp_size_local = int(meta.remote_dp_size_local)
         else:
             self.remote_dp_size_local = int(meta.remote_dp_size)
-        # WRITE does not support HMA, so unwrap blocks into flat lists.
-        # remote_block_ids can itself be empty so need to be careful when unwrapping.
-        local_block_ids = meta.local_block_ids[0]
-        remote_block_ids = meta.remote_block_ids[0] if meta.remote_block_ids else []
+        # GLM-5.3-Flash is a MULTI-GROUP hybrid-KV model (group0=MLA full-attn,
+        # group1=KpoolTail sliding-window, groups2-5=Mamba/KDA recurrent).
+        # meta.local_block_ids is per-group (list-of-lists), so pick THIS layer's
+        # group -- hardcoding [0] shipped group-0 blocks for every layer, so
+        # sliding-window + Mamba + sparse-indexer layers wrote to the wrong
+        # remote blocks and long-range recall was garbage. (Matches the READ
+        # path, which already indexes local_block_ids[group_idx].) The actual
+        # remote destination blocks are per-group too and arrive over the notify
+        # side-channel (RemoteAllocInfo.all_group_block_ids), selected per layer
+        # in the engine; remote_block_ids here is only an unused hint.
+        group_idx = self.layer_to_group[layer_name]
+        local_block_ids = (
+            meta.local_block_ids[group_idx]
+            if group_idx < len(meta.local_block_ids)
+            else meta.local_block_ids[0]
+        )
+        remote_block_ids = (
+            meta.remote_block_ids[group_idx]
+            if meta.remote_block_ids and group_idx < len(meta.remote_block_ids)
+            else (meta.remote_block_ids[0] if meta.remote_block_ids else [])
+        )
         self.schedule_write_blocks(
             request_id=req_id,
             transfer_id=meta.transfer_id,
