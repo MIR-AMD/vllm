@@ -325,6 +325,7 @@ class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
 
         assert isinstance(self._connector_metadata, MoRIIOConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
+        self.connector_worker.wait_for_all_reads()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         assert self.connector_worker is not None
@@ -2267,6 +2268,35 @@ class MoRIIOConnectorWorker:
                 )
                 return
 
+            time.sleep(0.001)
+
+    def wait_for_all_reads(self) -> None:
+        """GLM53_MORIIO_READ_STEP_BARRIER: block until every in-flight READ has landed.
+
+        wait_for_layer_load is skipped under FULL cudagraphs (capture and replay
+        alike), and it only covers layers that call it, so a transferred
+        request's first decode step could read KV, indexer or Mamba/KDA state
+        that is still arriving. This runs on the host before every forward, so
+        it holds in every cudagraph mode.
+        """
+        if self.is_producer or self.mode != MoRIIOMode.READ:
+            return
+        deadline = time.monotonic() + self.moriio_config.transfer_timeout
+        while True:
+            with self.moriio_wrapper.lock:
+                pending = [
+                    status
+                    for status_by_layer in self._recving_transfers.values()
+                    for status in status_by_layer.values()
+                ]
+            if all(status.Succeeded() or status.Failed() for status in pending):
+                return
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "MoRIIO READs still in flight after transfer_timeout; "
+                    "proceeding (request dropped via get_finished)."
+                )
+                return
             time.sleep(0.001)
 
     def _pop_done_transfers(self) -> set[str]:
