@@ -1243,6 +1243,18 @@ class Scheduler(SchedulerInterface):
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
                     has_sync_kv_loads = True
+                    if self.needs_kv_cache_zeroing:
+                        # GLM53_SYNC_LOAD_SKIP_ZERO: a sync load (e.g. MoRIIO
+                        # READ) also writes these blocks out of band during
+                        # this step; zeroing them races the write and can wipe
+                        # the loaded KV.
+                        self._skip_zero_block_ids.update(
+                            self.kv_cache_manager.get_zeroing_block_ids_in_range(
+                                request.request_id,
+                                num_new_local_computed_tokens,
+                                num_computed_tokens,
+                            )
+                        )
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
