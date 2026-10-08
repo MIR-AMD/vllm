@@ -460,7 +460,7 @@ def test_failed_read_reports_blocks_only_without_hma(has_mamba, expected_invalid
     assert worker.get_block_ids_with_load_errors() == expected_invalid
 
 
-def test_hybrid_step_barrier_fails_closed(monkeypatch):
+def test_hybrid_step_barrier_fails_closed():
     class FailingWrapper:
         def waiting_for_transfer_complete(self, _statuses):
             raise TransferError("failed")
@@ -471,15 +471,36 @@ def test_hybrid_step_barrier_fails_closed(monkeypatch):
     worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
     worker._has_mamba = True
     worker._reads_issued_this_step = [object()]
-    worker._mamba_reads_this_step = [object()]
     worker.moriio_wrapper = FailingWrapper()
-    monkeypatch.setattr(
-        "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector.get_forward_context",
-        lambda: SimpleNamespace(cudagraph_runtime_mode=None),
-    )
 
     with pytest.raises(TransferError, match="failed"):
         worker._await_reads_issued_this_step()
+
+
+def test_step_barrier_awaits_every_read_before_forward():
+    # Indexer caches have no per-layer hook, and the drafter may replay a FULL
+    # graph after a PIECEWISE target forward, so every read is awaited up front.
+    class RecordingWrapper:
+        def __init__(self):
+            self.awaited = []
+
+        def waiting_for_transfer_complete(self, statuses):
+            self.awaited.append(list(statuses))
+
+        def shutdown(self):
+            pass
+
+    attn, indexer, mtp_attn = object(), object(), object()
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker._has_mamba = False
+    worker._reads_issued_this_step = [attn, indexer, mtp_attn]
+    worker.moriio_wrapper = RecordingWrapper()
+
+    worker._await_reads_issued_this_step()
+    worker._await_reads_issued_this_step()
+
+    assert worker.moriio_wrapper.awaited == [[attn, indexer, mtp_attn]]
+    assert worker._reads_issued_this_step == []
 
 
 def test_requested_cudagraph_mode_is_never_overridden():
