@@ -14,6 +14,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import next_power_of_2
+from vllm.utils.torch_utils import direct_register_custom_op
 
 
 class FusedQKVRMSNormKernel(VllmTritonJitKernel["FusedQKVRMSNormKernel.CompileKey"]):
@@ -205,6 +206,18 @@ def fused_q_kv_rmsnorm(
     assert qr.stride(-1) == 1 and kv.stride(-1) == 1
     assert q_weight.is_contiguous() and kv_weight.is_contiguous()
 
+    # Dynamo cannot trace the raw Triton launch (fullgraph fails on
+    # `hasattr(kernel, "arg_names")`), so hide it behind an opaque custom op.
+    return torch.ops.vllm.fused_q_kv_rmsnorm(qr, kv, q_weight, kv_weight, eps)
+
+
+def _fused_q_kv_rmsnorm_impl(
+    qr: torch.Tensor,
+    kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
     qr_out = torch.empty(qr.shape, dtype=qr.dtype, device=qr.device)
     kv_out = torch.empty(kv.shape, dtype=kv.dtype, device=kv.device)
     if qr.shape[0] > 0:
@@ -218,6 +231,25 @@ def fused_q_kv_rmsnorm(
             eps,
         )
     return qr_out, kv_out
+
+
+def _fused_q_kv_rmsnorm_fake(
+    qr: torch.Tensor,
+    kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    qr_out = torch.empty(qr.shape, dtype=qr.dtype, device=qr.device)
+    kv_out = torch.empty(kv.shape, dtype=kv.dtype, device=kv.device)
+    return qr_out, kv_out
+
+
+direct_register_custom_op(
+    op_name="fused_q_kv_rmsnorm",
+    op_func=_fused_q_kv_rmsnorm_impl,
+    fake_impl=_fused_q_kv_rmsnorm_fake,
+)
 
 
 _FUSED_Q_KV_RMSNORM_KERNEL = FusedQKVRMSNormKernel()
