@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from vllm.models.common.ops.fused_qk_rmsnorm import (
+    _FUSED_Q_KV_RMSNORM_KERNEL,
     fused_q_kv_rmsnorm,
 )
 from vllm.platforms import current_platform
@@ -82,6 +83,47 @@ def test_fused_q_kv_rmsnorm_outputs_are_packed(num_tokens: int):
     tol = dict(rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(qr_out, qr_ref, **tol)
     torch.testing.assert_close(kv_out, kv_ref, **tol)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16])
+def test_fused_q_kv_rmsnorm_opcheck(num_tokens: int):
+    device = "cuda"
+    dtype = torch.bfloat16
+    q_size, kv_size = 192, 576
+    fused = torch.randn(num_tokens, q_size + kv_size, dtype=dtype, device=device)
+    qr, kv = fused.split([q_size, kv_size], dim=-1)
+    qw = torch.randn(q_size, dtype=dtype, device=device)
+    kvw = torch.randn(kv_size, dtype=dtype, device=device)
+
+    torch.library.opcheck(
+        torch.ops.vllm.fused_q_kv_rmsnorm.default, (qr, kv, qw, kvw, 1e-6)
+    )
+
+
+def test_fused_q_kv_rmsnorm_compiles_fullgraph():
+    """Regression guard: the raw Triton launch is not Dynamo-traceable, which
+    broke fullgraph compilation (and with it PIECEWISE CUDA graphs) for MLA
+    layers that use the fused norm."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    q_size, kv_size = 192, 576
+    fused = torch.randn(16, q_size + kv_size, dtype=dtype, device=device)
+    qw = torch.randn(q_size, dtype=dtype, device=device)
+    kvw = torch.randn(kv_size, dtype=dtype, device=device)
+
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        qr, kv = x.split([q_size, kv_size], dim=-1)
+        return fused_q_kv_rmsnorm(qr, kv, qw, kvw, 1e-6)
+
+    # An earlier eager launch caches the kernel arg names and hides the trace
+    # failure; at server startup, Dynamo traces before any eager launch.
+    _FUSED_Q_KV_RMSNORM_KERNEL.__dict__.pop("_kernel_arg_names", None)
+    torch._dynamo.reset()
+    qr_out, kv_out = torch.compile(fn, fullgraph=True)(fused)
+
+    qr_ref, kv_ref = fn(fused)
+    torch.testing.assert_close(qr_out, qr_ref)
+    torch.testing.assert_close(kv_out, kv_ref)
 
 
 @pytest.mark.parametrize("num_tokens", [65535, 65536, 131072])
