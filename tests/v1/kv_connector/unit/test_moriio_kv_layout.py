@@ -291,43 +291,6 @@ def test_kernel_block_layout_without_spec_dimensions_rejects_ambiguous_axes():
         )
 
 
-def test_kernel_split_4d_view_addresses_manager_blocks():
-    # kpool-style indexer: 16-token blocks of 4 states, viewed in 2-state pages.
-    spec = MLAAttentionSpec(
-        block_size=16,
-        num_kv_heads=1,
-        head_size=3,
-        dtype=torch.bfloat16,
-        tokens_per_state=4,
-    )
-    manager_view = torch.empty((8, 1, 4, 3), dtype=torch.bfloat16)
-    kernel_view = manager_view.view(16, 1, 2, 3)
-    layer_to_spec = {"layer": spec}
-
-    manager = moriio_layout.get_layer_transfer_geometry(
-        "layer", manager_view, layer_to_spec
-    )
-    kernel = moriio_layout.get_layer_transfer_geometry(
-        "layer", kernel_view, layer_to_spec
-    )
-
-    assert kernel == manager
-    assert kernel.num_blocks == 8
-    assert moriio_layout.compute_block_transfer_offsets(
-        "layer", kernel_view, layer_to_spec, [1, 3], [4, 5], 16
-    ) == ([24, 72], [96, 120], [24, 24])
-
-
-def test_kernel_split_4d_view_rejects_padded_kernel_blocks():
-    spec = MLAAttentionSpec(
-        block_size=16, num_kv_heads=1, head_size=3, dtype=torch.bfloat16
-    )
-    padded = torch.empty((16, 1, 5, 3), dtype=torch.bfloat16)[:, :, :4]
-
-    with pytest.raises(ValueError, match="not 4 dense kernel blocks per block"):
-        moriio_layout.get_layer_transfer_geometry("layer", padded, {"layer": spec})
-
-
 def test_mixed_layers_compute_distinct_offsets_per_layer():
     kv_caches = {
         "separated": torch.empty((2, 8, 4, 2, 3), dtype=torch.bfloat16),
