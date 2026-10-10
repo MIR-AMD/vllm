@@ -94,6 +94,7 @@ from vllm.utils.network_utils import (
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     MambaSpec,
@@ -549,13 +550,20 @@ class MoRIIOConnectorScheduler:
             )
         )
         if self._is_hma_required:
-            # MoRIIO handles sliding-window attention and mamba/KDA groups in
-            # READ mode. Other hybrid cache specs still fail closed.
+            # MoRIIO handles sliding-window attention, circular-buffer (one
+            # block per request, e.g. the kpool tail ring) and mamba/KDA groups
+            # in READ mode. Other hybrid cache specs still fail closed.
+            supported = (
+                FullAttentionSpec,
+                SlidingWindowSpec,
+                CircularBufferSpec,
+                MambaSpec,
+            )
             unsupported = [
                 type(g.kv_cache_spec).__name__
                 for g in kv_cache_config.transfer_groups
                 if not all(
-                    isinstance(spec, (FullAttentionSpec, SlidingWindowSpec, MambaSpec))
+                    isinstance(spec, supported)
                     for spec in iter_layer_specs(g.kv_cache_spec)
                 )
             ]
