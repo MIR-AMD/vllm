@@ -21,8 +21,10 @@ from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -445,6 +447,52 @@ def test_scheduler_classifies_packed_mamba_group_as_mamba():
         [1 - mamba_group],
         [mamba_group],
     )
+
+
+@pytest.mark.usefixtures("restore_moriio_role")
+@pytest.mark.parametrize("packed", [False, True])
+def test_scheduler_reads_circular_buffer_group(packed):
+    """A circular-buffer ring (one block per request) pairs 1:1, unclipped."""
+    full = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32
+    )
+    ring = CircularBufferSpec(
+        block_size=8, num_kv_heads=1, head_size=8, dtype=torch.float32
+    )
+    if packed:
+        config = _packed_kv_cache_config({"layers.0": full, "layers.1": ring})
+    else:
+        config = KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["layers.0"], full),
+                KVCacheGroupSpec(["layers.1"], ring),
+            ],
+        )
+    ring_group = next(
+        gi for gi, g in enumerate(config.transfer_groups) if "layers.1" in g.layer_names
+    )
+
+    scheduler = moriio_connector.MoRIIOConnectorScheduler(
+        _gate_vllm_config(), "engine", config
+    )
+
+    assert scheduler._attn_group_ids == [0, 1]
+    assert scheduler._mamba_group_ids == []
+    assert scheduler.blocks_per_sw == [0, 0]
+
+    remote: list[list[int]] = [[10, 11], [10, 11]]
+    local: list[list[int]] = [[100, 101, 102], [100, 101, 102]]
+    remote[ring_group], local[ring_group] = [50], [300]
+    scheduler.update_state_after_alloc(
+        _make_read_request(remote), _FakeBlocks(tuple(local)), num_external_tokens=32
+    )
+
+    expected_local = [[100, 101], [100, 101]]
+    expected_local[ring_group] = [300]
+    assert scheduler._reqs_need_recv["req"][1] == expected_local
+    assert scheduler._req_kv_params["req"]["remote_block_ids"] == remote
 
 
 def test_split_block_groups_rejects_non_hybrid_use():
