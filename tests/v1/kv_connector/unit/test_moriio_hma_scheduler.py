@@ -17,9 +17,16 @@ import pytest
 import torch
 
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
-from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheSpec,
+    UniformTypeKVCacheSpecs,
+)
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 moriio_connector = importlib.import_module(
     "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector"
@@ -397,6 +404,47 @@ def test_scheduler_rejects_hybrid_write():
         moriio_connector.MoRIIOConnectorScheduler(
             _gate_vllm_config(read_mode=False), "engine", config
         )
+
+
+def _packed_kv_cache_config(specs: dict[str, KVCacheSpec]) -> KVCacheConfig:
+    """Groups from the real grouping under the block-outermost BLHNC layout,
+    which wraps every group spec in ``UniformTypeKVCacheSpecs``."""
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC
+        ),
+    )
+    groups = get_kv_cache_groups(vllm_config, specs)
+    assert all(isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in groups)
+    return KVCacheConfig(num_blocks=64, kv_cache_tensors=[], kv_cache_groups=groups)
+
+
+@pytest.mark.usefixtures("restore_moriio_role")
+def test_scheduler_classifies_packed_mamba_group_as_mamba():
+    full = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32
+    )
+    specs: dict[str, KVCacheSpec] = {
+        f"layers.{i}": full if i % 3 == 2 else _mamba_spec() for i in range(6)
+    }
+    config = _packed_kv_cache_config(specs)
+    mamba_group = next(
+        gi for gi, g in enumerate(config.transfer_groups) if "layers.0" in g.layer_names
+    )
+
+    scheduler = moriio_connector.MoRIIOConnectorScheduler(
+        _gate_vllm_config(), "engine", config
+    )
+
+    assert scheduler._mamba_group_ids == [mamba_group]
+    assert scheduler._attn_group_ids == [1 - mamba_group]
+    assert moriio_connector._split_kv_cache_group_kinds(config) == (
+        [1 - mamba_group],
+        [mamba_group],
+    )
 
 
 def test_split_block_groups_rejects_non_hybrid_use():
