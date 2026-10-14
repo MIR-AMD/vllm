@@ -1818,10 +1818,10 @@ class MoRIIOConnectorWorker:
         # This step's posted reads, awaited before the forward when the
         # per-layer barrier cannot run.
         self._reads_issued_this_step: list = []
-        # This step's posted recurrent-state reads. Mamba layers are not
-        # wrapped by the attention KV-transfer decorator, so wait_for_layer_load
-        # never fires for them and these must be awaited in start_load_kv.
-        self._mamba_reads_this_step: list = []
+        # This step's posted reads for layers wait_for_layer_load never fires
+        # for (see _hookless_layer_names); always awaited in start_load_kv.
+        self._hookless_reads_this_step: list = []
+        self._hookless_layers: set[str] = set()
 
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
@@ -2242,6 +2242,23 @@ class MoRIIOConnectorWorker:
         """True for a hybrid/KDA layer backed by a packed state page."""
         return isinstance(self.layer_to_spec.get(layer_name), MambaSpec)
 
+    def _hookless_layer_names(self, layer_names: Collection[str]) -> set[str]:
+        """Layers whose forward never calls wait_for_layer_load.
+
+        Only Attention and MLAAttention run through @maybe_transfer_kv_layer.
+        Everything else, e.g. mamba/KDA state or sparse-attention indexer
+        caches (DeepseekV32IndexerCache), has no per-layer barrier. Unknown
+        layers count as hookless so their reads are still awaited.
+        """
+        from vllm.model_executor.layers.attention import Attention, MLAAttention
+
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        return {
+            name
+            for name in layer_names
+            if not isinstance(forward_context.get(name), (Attention, MLAAttention))
+        }
+
     @staticmethod
     def _contiguous_byte_alias(tensor: torch.Tensor) -> torch.Tensor:
         """Return a contiguous uint8 view over ``tensor``'s full byte extent.
@@ -2387,6 +2404,7 @@ class MoRIIOConnectorWorker:
                     "state layout; set VLLM_SSM_CONV_STATE_LAYOUT=DS"
                 )
             self._conv_decomp = derive_mamba_conv_split(mamba_spec, self.world_size)
+        self._hookless_layers = self._hookless_layer_names(kv_caches)
         # KDA layers use packed pages with different geometry; only record
         # attention tensor shapes here.
         self.kv_cache_shapes = {
@@ -2853,10 +2871,12 @@ class MoRIIOConnectorWorker:
         overlap later transfers, but it only fires for layers that go through
         the attention KV-transfer decorator. Two cases fall through it:
 
-        * mamba/KDA layers have no such hook at all, so their conv+ssm reads
-          would otherwise be consumed while still in flight;
+        * layers with no such hook at all (mamba/KDA state, sparse-attention
+          indexer caches), whose reads would otherwise be consumed while
+          still in flight;
         * under CUDAGraphMode.FULL a host-side blocking wait is illegal
-          anywhere in the graph, so every read is awaited here instead.
+          anywhere in the graph, so every read is awaited here instead. This
+          relies on the runner setting the FULL mode for pre_forward.
 
         start_load_kv runs outside the graph, so blocking here is safe.
         Attention reads keep their per-layer overlap in the non-FULL case.
@@ -2869,12 +2889,12 @@ class MoRIIOConnectorWorker:
         """
         all_statuses = self._reads_issued_this_step
         self._reads_issued_this_step = []
-        mamba_statuses = self._mamba_reads_this_step
-        self._mamba_reads_this_step = []
+        hookless_statuses = self._hookless_reads_this_step
+        self._hookless_reads_this_step = []
         if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
             statuses = all_statuses
         else:
-            statuses = mamba_statuses
+            statuses = hookless_statuses
         if not statuses:
             return
         try:
@@ -3762,10 +3782,10 @@ class MoRIIOConnectorWorker:
                 # Awaited before the forward when the per-layer barrier cannot
                 # run (see _await_reads_issued_this_step).
                 self._reads_issued_this_step.extend(statuses)
-                if self._is_mamba_layer(layer_name):
-                    # No per-layer barrier exists for mamba layers, so these are
+                if layer_name in self._hookless_layers:
+                    # No per-layer barrier exists for this layer, so these are
                     # always awaited in start_load_kv.
-                    self._mamba_reads_this_step.extend(statuses)
+                    self._hookless_reads_this_step.extend(statuses)
                 self._recving_transfers_callback_addr[request_id] = (
                     remote_host,
                     str(

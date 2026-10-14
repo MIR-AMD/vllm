@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.config import CUDAGraphMode
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOMode,
     MoRIIOTransferAck,
@@ -22,6 +23,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
     MoRIIOWrapper,
 )
+from vllm.model_executor.layers.attention import Attention, MLAAttention
+from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 
 
 def test_remote_tp_rank_same_tp_maps_to_self():
@@ -471,7 +474,7 @@ def test_hybrid_step_barrier_fails_closed(monkeypatch):
     worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
     worker._has_mamba = True
     worker._reads_issued_this_step = [object()]
-    worker._mamba_reads_this_step = [object()]
+    worker._hookless_reads_this_step = [object()]
     worker.moriio_wrapper = FailingWrapper()
     monkeypatch.setattr(
         "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector.get_forward_context",
@@ -480,6 +483,82 @@ def test_hybrid_step_barrier_fails_closed(monkeypatch):
 
     with pytest.raises(TransferError, match="failed"):
         worker._await_reads_issued_this_step()
+
+
+def test_hookless_layers_are_non_attention_modules():
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={
+                "attn": Attention.__new__(Attention),
+                "mla": MLAAttention.__new__(MLAAttention),
+                "indexer": DeepseekV32IndexerCache.__new__(DeepseekV32IndexerCache),
+            }
+        )
+    )
+
+    assert worker._hookless_layer_names(["attn", "mla", "indexer", "unknown"]) == {
+        "indexer",
+        "unknown",
+    }
+
+
+class _RecordingWrapper:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.awaited = []
+
+    def waiting_for_transfer_complete(self, statuses):
+        self.awaited.append(list(statuses))
+
+    def shutdown(self):
+        pass
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (CUDAGraphMode.PIECEWISE, ["indexer"]),
+        (CUDAGraphMode.NONE, ["indexer"]),
+        (CUDAGraphMode.FULL, ["attn", "indexer"]),
+    ],
+)
+def test_step_barrier_awaits_hookless_reads_before_forward(monkeypatch, mode, expected):
+    # Indexer caches never call wait_for_layer_load, so their reads must be
+    # awaited before the forward; attention reads keep their per-layer wait
+    # unless a FULL graph replay skips it.
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker._has_mamba = False
+    worker._reads_issued_this_step = ["attn", "indexer"]
+    worker._hookless_reads_this_step = ["indexer"]
+    worker.moriio_wrapper = _RecordingWrapper()
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector.get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=mode),
+    )
+
+    worker._await_reads_issued_this_step()
+
+    assert worker.moriio_wrapper.awaited == [expected]
+    assert worker._reads_issued_this_step == []
+    assert worker._hookless_reads_this_step == []
+
+
+def test_wait_for_layer_load_awaits_only_that_layer(monkeypatch):
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.is_producer = False
+    worker.mode = MoRIIOMode.READ
+    worker._has_mamba = False
+    worker._recving_transfers = {"req": {"attn": ["attn-read"], "other": ["x"]}}
+    worker.moriio_wrapper = _RecordingWrapper()
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector.get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE),
+    )
+
+    worker.wait_for_layer_load("attn")
+
+    assert worker.moriio_wrapper.awaited == [["attn-read"]]
 
 
 def test_requested_cudagraph_mode_is_never_overridden():
