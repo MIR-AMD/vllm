@@ -320,14 +320,17 @@ class MuseSparkMoE(nn.Module):
 
     @functools.cached_property
     def _experts_take_expanded_input(self) -> bool:
-        """Whether the experts consume one input row per route (AITER MXFP4)."""
+        """Whether the experts consume one input row per route (AITER MXFP4).
+
+        Not under an all2all: the experts expand the dispatched rows themselves.
+        """
         norm = self.pre_expert_norm
+        quant_method = self.experts.routed_experts.quant_method
         return (
             norm is not None
             and norm.variance_size_override is None
-            and isinstance(
-                self.experts.routed_experts.quant_method, MuseSparkQuarkOCPMXFusedMoE
-            )
+            and isinstance(quant_method, MuseSparkQuarkOCPMXFusedMoE)
+            and not quant_method.moe.moe_parallel_config.use_all2all_kernels
         )
 
     def _pool(self, hidden_states: torch.Tensor) -> torch.Tensor:

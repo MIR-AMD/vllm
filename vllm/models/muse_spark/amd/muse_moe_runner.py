@@ -38,6 +38,9 @@ from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+    TopKWeightAndReduceNoOP,
+)
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
@@ -71,11 +74,30 @@ _FINALIZE_CHUNK_ELEMS = 32 * 1024 * 1024
 _TOKEN_SHARDED_MIN_TOKENS = 256
 
 
+def finalizes_before_mori_combine(moe_config: FusedMoEConfig) -> bool:
+    """Whether each expert rank finalizes its own routes before a MoRI combine.
+
+    MoRI EPv1 sends a token once to every rank owning one of its experts and
+    its combine only sums the rows those ranks send back, without router
+    weights. Each rank therefore emits ``sum_k w_k * norm(out_k)`` over its
+    local routes. Only validated with one EP rank per DP rank (attention TP1).
+    """
+    parallel_config = moe_config.moe_parallel_config
+    return (
+        parallel_config.use_mori_epv1_kernels
+        and parallel_config.tp_size == 1
+        and parallel_config.pcp_size == 1
+        and parallel_config.ep_size == parallel_config.dp_size
+    )
+
+
 def _validate_tp_post_norm_deployment(
-    moe_config: FusedMoEConfig, precision: str
+    moe_config: FusedMoEConfig, precision: str, *, allow_mori_ep: bool = False
 ) -> None:
     parallel_config = moe_config.moe_parallel_config
-    if parallel_config.dp_size != 1 or parallel_config.pcp_size != 1:
+    if (parallel_config.dp_size != 1 or parallel_config.pcp_size != 1) and not (
+        allow_mori_ep and finalizes_before_mori_combine(moe_config)
+    ):
         raise NotImplementedError(
             f"Muse Spark {precision} on ROCm currently requires DP1 and PCP1."
         )
@@ -110,7 +132,7 @@ def validate_bf16_deployment(moe_config: FusedMoEConfig) -> None:
 
 def validate_mxfp4_deployment(moe_config: FusedMoEConfig) -> None:
     """Reject deployments whose MXFP4 finalization is not implemented."""
-    _validate_tp_post_norm_deployment(moe_config, "MXFP4")
+    _validate_tp_post_norm_deployment(moe_config, "MXFP4", allow_mori_ep=True)
 
 
 def validate_fp8_deployment(moe_config: FusedMoEConfig) -> None:
@@ -291,6 +313,11 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
         out.copy_(gathered[:num_tokens])
 
 
+def _repeat_rows(x: torch.Tensor, repeats: int) -> torch.Tensor:
+    """``x`` with every row repeated ``repeats`` times, copied as raw bytes."""
+    return x.view(torch.uint8).repeat_interleave(repeats, dim=0).view(x.dtype)
+
+
 class _RouteOutputHandoff:
     """Hand the experts' per-route buffer to the finalize instead of copying it."""
 
@@ -427,6 +454,46 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
         if quant_config.post_expert_norm_fn is None:
             raise ValueError("Muse Spark post-expert norm is not configured.")
         self._unit_weights_bufs: dict[int, torch.Tensor] = {}
+        self._local_finalize = (
+            self._make_local_finalize(quant_config.post_expert_norm_fn)
+            if finalizes_before_mori_combine(moe_config)
+            else None
+        )
+
+    def _make_local_finalize(
+        self, post_expert_norm_fn: Callable[..., torch.Tensor]
+    ) -> MuseSparkTopKWeightAndReduce:
+        return MuseSparkTopKWeightAndReduce(
+            post_expert_norm_fn,
+            pre_norm_all_reduce=False,
+            take_route_output=self._take_route_output,
+            take_route_expert_map=self._take_route_expert_map,
+        )
+
+    def _finalize_received_routes(
+        self,
+        output: torch.Tensor,
+        route_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_mask: torch.Tensor,
+        num_received: torch.Tensor,
+    ) -> None:
+        """Write ``sum_k w_k * norm(route_output[t, k])`` over the local routes.
+
+        ``expert_mask`` is AITER's 0/1 local-expert mask. Rows from
+        ``num_received`` on are stale MoRI buffer rows that combine never reads;
+        their ids may be garbage, so they are masked as well.
+        """
+        assert self._local_finalize is not None
+        received = (
+            torch.arange(topk_ids.shape[0], device=topk_ids.device) < num_received
+        )
+        local_ids = torch.where(received.unsqueeze(1), topk_ids, -1)
+        self._park_route_output(route_output, expert_mask.to(torch.int32) - 1)
+        self._local_finalize.apply(
+            output, route_output, topk_weights, local_ids, False
+        )
 
     def _unit_weights(
         self, num_routes: int, width: int, device: torch.device
@@ -451,7 +518,7 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        workspace13, workspace2, _ = super().workspace_shapes(
+        workspace13, workspace2, output = super().workspace_shapes(
             M,
             N,
             K,
@@ -461,6 +528,8 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
             expert_tokens_meta,
             activation,
         )
+        if self._local_finalize is not None:
+            return workspace13, workspace2, output
         return workspace13, workspace2, (M, topk, K)
 
     def apply(
@@ -488,21 +557,28 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
 
         num_tokens, top_k = topk_ids.shape
         hidden_dim = hidden_states.shape[-1]
-        expected_output_shape = (num_tokens, top_k, hidden_dim)
-        if output.shape != expected_output_shape:
-            raise ValueError(
-                "Muse Spark AITER output has shape "
-                f"{tuple(output.shape)}, expected {expected_output_shape}."
-            )
+        if self._local_finalize is not None:
+            # MoRI hands over packed MXFP4 rows and their scales; repeat both
+            # bytewise, one row per route.
+            expanded_hidden_states = _repeat_rows(hidden_states, top_k)
+            if a1q_scale is not None:
+                a1q_scale = _repeat_rows(a1q_scale, top_k)
+        else:
+            expected_output_shape = (num_tokens, top_k, hidden_dim)
+            if output.shape != expected_output_shape:
+                raise ValueError(
+                    "Muse Spark AITER output has shape "
+                    f"{tuple(output.shape)}, expected {expected_output_shape}."
+                )
 
-        expanded_hidden_states = take_expanded(hidden_states, top_k)
-        if expanded_hidden_states is None:
-            expanded_hidden_states = (
-                hidden_states[:, None, :]
-                .expand(num_tokens, top_k, hidden_dim)
-                .reshape(num_tokens * top_k, hidden_dim)
-                .contiguous()
-            )
+            expanded_hidden_states = take_expanded(hidden_states, top_k)
+            if expanded_hidden_states is None:
+                expanded_hidden_states = (
+                    hidden_states[:, None, :]
+                    .expand(num_tokens, top_k, hidden_dim)
+                    .reshape(num_tokens * top_k, hidden_dim)
+                    .contiguous()
+                )
         # Only the shape of topk_ids is read after the experts.
         num_routes = num_tokens * top_k
         flat_topk_ids = topk_ids.view(num_routes, 1)
@@ -521,6 +597,9 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
             num_local_tokens = expert_tokens_meta.expert_num_tokens
         else:
             num_local_tokens = None
+        num_received = num_local_tokens
+        if self._local_finalize is not None and num_local_tokens is not None:
+            num_local_tokens = num_local_tokens * top_k
 
         route_output = rocm_aiter_fused_experts(
             hidden_states=expanded_hidden_states,
@@ -540,9 +619,23 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
             apply_router_weight_on_input=False,
             **self._extra_fused_moe_kwargs(),
         )
-        self._park_route_output(route_output.view_as(output))
+        if self._local_finalize is None:
+            self._park_route_output(route_output.view_as(output))
+            return
+        assert expert_map is not None and num_received is not None
+        self._finalize_received_routes(
+            output,
+            route_output.view(num_tokens, top_k, output.shape[-1]),
+            topk_weights,
+            topk_ids,
+            expert_map,
+            num_received,
+        )
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+        if self._local_finalize is not None:
+            # The combine sums the rows apply() already finalized.
+            return TopKWeightAndReduceNoOP()
         quant_config = self.quant_config
         assert isinstance(quant_config, MuseSparkQuarkOCPMXMoEQuantConfig)
         assert quant_config.post_expert_norm_fn is not None
