@@ -9,6 +9,7 @@ own routes: ``sum_k w_k * norm(out_k)`` over its local experts.
 
 from collections.abc import Callable
 from dataclasses import fields
+from math import prod
 
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ import pytest
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+import vllm.models.muse_spark.amd.muse_moe_runner as mori_runner
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -38,6 +40,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Static,
 )
 from vllm.models.muse_spark.amd.model import MuseSparkMoE
+from vllm.models.muse_spark.amd.ops.gather_rows import gather_rows
 from vllm.models.muse_spark.amd.muse_moe_runner import (
     MuseSparkAiterExperts,
     MuseSparkQuarkOCPMXFusedMoE,
@@ -47,9 +50,13 @@ from vllm.models.muse_spark.amd.muse_moe_runner import (
     MuseSparkUnquantizedFusedMoE,
     MuseSparkUnquantizedMoEQuantConfig,
     finalizes_before_mori_combine,
+    route_chunk_tokens,
     validate_bf16_deployment,
     validate_fp8_deployment,
     validate_mxfp4_deployment,
+)
+from vllm.models.muse_spark.common.ops.fused_finalize import (
+    fused_post_expert_finalize,
 )
 
 
@@ -215,31 +222,35 @@ def _simulate_mori_ep(
     tokens_per_rank: int,
     seed: int,
     backend: str,
+    routing: str,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Run the Muse experts' apply on every simulated EP rank behind a
     MoRI-style dispatch/combine. Returns (combined, reference) per source rank.
 
     ``mxfp4`` runs MuseSparkAiterExperts with AITER faked; ``bf16`` runs
-    MuseSparkTritonExperts with the stock Triton GEMMs faked."""
+    MuseSparkTritonExperts with the stock Triton GEMMs faked. ``rank0_only``
+    routes every token to rank 0's experts, so the other ranks receive nothing.
+    """
     gen = torch.Generator().manual_seed(seed)
     local = num_experts // ep_size
+    assert top_k <= local
     eps = 1e-6
     gain = torch.rand(hidden, generator=gen) + 0.5
     norm_fn = _rms_norm_with_input_scale(gain, eps)
     expert_w = torch.randn(num_experts, hidden, hidden, generator=gen) / hidden**0.5
 
+    pool = local if routing == "rank0_only" else num_experts
     x = [torch.randn(tokens_per_rank, hidden, generator=gen) for _ in range(ep_size)]
     ids = [
         torch.stack(
             [
-                torch.randperm(num_experts, generator=gen)[:top_k]
+                torch.randperm(pool, generator=gen)[:top_k]
                 for _ in range(tokens_per_rank)
             ]
         ).to(torch.int32)
         for _ in range(ep_size)
     ]
-    # Token 0 of rank 0 routes only to rank 0's experts: other ranks get nothing.
-    assert top_k <= local
+    # Token 0 of rank 0 routes only to rank 0's experts.
     ids[0][0] = torch.arange(top_k, dtype=torch.int32)
     w = [
         torch.softmax(torch.randn(tokens_per_rank, top_k, generator=gen), -1)
@@ -271,20 +282,21 @@ def _simulate_mori_ep(
         assert bool((flat_ids[:, 1] == mask.shape[0] - 1).all())
         assert bool((kwargs["topk_weights"] == 1).all())
         assert kwargs["apply_router_weight_on_input"] is False
-        calls.append(kwargs)
-        # Routes AITER skips (remote experts, rows past the receive count)
-        # are left unwritten: poison them.
+        # One output row per packed route, within the per-call byte budget.
+        assert hs.shape[0] * hidden * 4 <= mori_runner._ROUTE_CHUNK_BYTES
+        # Packed slots past the route count carry the always-masked expert.
+        assert bool((flat_ids[n:, 0] == mask.shape[0] - 1).all())
+        calls.append({k: kwargs[k] for k in ("hidden_states", "a1q_scale")})
+        calls[-1].update(ids=flat_ids[:n, 0].clone())
+        # Rows AITER skips (past the route count) are left unwritten.
         out = torch.full((hs.shape[0], hidden), float("nan"))
         for i in range(n):
             e = int(flat_ids[i, 0])
-            if mask[e]:
-                out[i] = hs[i].float() @ expert_w[e]
+            assert mask[e]
+            out[i] = hs[i].float() @ expert_w[e]
         return out.to(kwargs["output_dtype"])
 
-    monkeypatch.setattr(
-        "vllm.models.muse_spark.amd.muse_moe_runner.rocm_aiter_fused_experts",
-        _fake_aiter,
-    )
+    monkeypatch.setattr(mori_runner, "rocm_aiter_fused_experts", _fake_aiter)
 
     def _fake_triton_apply(
         self, output, hidden_states, w1, w2, topk_weights, topk_ids, activation,
@@ -293,7 +305,9 @@ def _simulate_mori_ep(
     ) -> None:  # fmt: skip
         assert not self._apply_router_weight_in_gemm2(apply_router_weight_on_input)
         assert output.shape == hidden_states.shape
-        calls.append({"topk_ids": topk_ids.clone(), "a1q_scale": a1q_scale})
+        calls.append({"ids": topk_ids.clone(), "a1q_scale": a1q_scale})
+        # The GEMMs use workspace13 as scratch.
+        workspace13.fill_(float("nan"))
         # GEMM2 rows of skipped routes (remote, padding) are never written.
         rows = torch.full((*topk_ids.shape, hidden), float("nan"))
         for i, k in (topk_ids >= 0).nonzero().tolist():
@@ -303,10 +317,13 @@ def _simulate_mori_ep(
         self._finalize_expert_output(rows, output, topk_ids, expert_map)
 
     monkeypatch.setattr(TritonExperts, "apply", _fake_triton_apply)
+    # A small budget so several chunks run per rank.
+    monkeypatch.setattr(mori_runner, "_ROUTE_CHUNK_BYTES", 3 * top_k * hidden * 4)
 
     config = _moe_config(
         dp_size=ep_size, num_experts=num_experts, top_k=top_k, hidden_size=hidden
     )
+    config.in_dtype = torch.float32
     for r in range(ep_size):
         owned = range(r * local, (r + 1) * local)
         # MoRI dispatch: each source token once per destination rank.
@@ -347,22 +364,22 @@ def _simulate_mori_ep(
         assert isinstance(
             experts.finalize_weight_and_reduce_impl(), TopKWeightAndReduceNoOP
         )
-        out_shape = experts.workspace_shapes(
-            capacity,
-            2 * hidden,
-            hidden,
-            top_k,
-            num_experts,
-            local,
-            None,
+        ws13_shape, _, out_shape = experts.workspace_shapes(
+            capacity, 2 * hidden, hidden, top_k, num_experts, local, None,
             MoEActivation.SILU,
-        )[2]
+        )  # fmt: skip
         assert out_shape == (capacity, hidden)
-        output = torch.full(out_shape, float("nan"))
+        # As the modular kernel: workspace13 and the output share storage.
+        common = torch.full(
+            (max(prod(ws13_shape), prod(out_shape)),), float("nan")
+        )
+        output = common[: prod(out_shape)].view(out_shape)
+        workspace13 = common[: prod(ws13_shape)].view(ws13_shape)
+        first_call = len(calls)
         experts.apply(
             output,
             recv_x,
-            torch.empty(0),
+            torch.empty(local, 2 * hidden, 0),
             torch.empty(0),
             recv_w,
             recv_ids,
@@ -371,7 +388,7 @@ def _simulate_mori_ep(
             expert_map,
             recv_scale,
             None,
-            torch.empty(0),
+            workspace13,
             torch.empty(0),
             mk.ExpertTokensMetadata(
                 expert_num_tokens=torch.tensor([n], dtype=torch.int32),
@@ -379,29 +396,46 @@ def _simulate_mori_ep(
             ),
             False,
         )
-        call = calls[-1]
+        rank_calls = calls[first_call:]
+        chunk_tokens = (
+            3
+            if backend == "mxfp4"
+            else experts._chunk_tokens(2 * hidden, hidden, top_k)
+        )
+        assert len(rank_calls) == -(-capacity // chunk_tokens)
         if backend == "mxfp4":
+            # Packed token-major: (received row, local expert) per route.
+            packed = [
+                (j, int(e)) for j in range(n) for e in recv_ids[j] if int(e) in owned
+            ]
+            rows = torch.tensor([j for j, _ in packed], dtype=torch.long)
+            got_ids = torch.cat([c["ids"] for c in rank_calls])
             torch.testing.assert_close(
-                call["hidden_states"], recv_x.repeat_interleave(top_k, dim=0)
+                got_ids, torch.tensor([e for _, e in packed], dtype=torch.int32)
             )
-            torch.testing.assert_close(
-                call["a1q_scale"], recv_scale.repeat_interleave(top_k, dim=0)
-            )
-            assert int(call["num_local_tokens"]) == n * top_k
+            got_x, got_scale = [], []
+            for c in rank_calls:
+                k = c["ids"].numel()
+                got_x.append(c["hidden_states"][:k])
+                got_scale.append(c["a1q_scale"][:k])
+            torch.testing.assert_close(torch.cat(got_x), recv_x[rows])
+            torch.testing.assert_close(torch.cat(got_scale), recv_scale[rows])
         else:
             # Stale rows reach the Triton GEMMs only as padding routes.
-            assert bool((call["topk_ids"][n:] == -1).all())
-            torch.testing.assert_close(call["topk_ids"][:n], recv_ids[:n])
-            assert call["a1q_scale"] is None
+            got_ids = torch.cat([c["ids"] for c in rank_calls])
+            assert bool((got_ids[n:] == -1).all())
+            torch.testing.assert_close(got_ids[:n], recv_ids[:n])
+            assert all(c["a1q_scale"] is None for c in rank_calls)
         assert experts._take_route_output() is None
-        # Every row, including the stale tail, is finite.
-        assert bool(torch.isfinite(output).all())
+        # Combine reads only the received rows.
+        assert bool(torch.isfinite(output[:n]).all())
         # MoRI combine: an unweighted sum of the returned rows per source token.
         for j, (s, t) in enumerate(received):
             combined[s][t] += output[j]
     return combined, reference
 
 
+@pytest.mark.parametrize("routing", ["random", "rank0_only"])
 @pytest.mark.parametrize("backend", ["mxfp4", "bf16"])
 @pytest.mark.parametrize(
     "ep_size,num_experts,top_k", [(2, 8, 2), (4, 16, 4), (8, 64, 6)]
@@ -412,6 +446,7 @@ def test_ep_rank_partials_sum_to_the_dp1_output(
     num_experts: int,
     top_k: int,
     backend: str,
+    routing: str,
 ) -> None:
     combined, reference = _simulate_mori_ep(
         monkeypatch,
@@ -422,9 +457,47 @@ def test_ep_rank_partials_sum_to_the_dp1_output(
         tokens_per_rank=5,
         seed=ep_size,
         backend=backend,
+        routing=routing,
     )
     for got, ref in zip(combined, reference):
         torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-5)
+
+
+# Muse Spark: 256 experts, top-8, MoE hidden 8192.
+@pytest.mark.parametrize("ep_size", [8, 16, 32])
+@pytest.mark.parametrize("max_num_batched_tokens", [2048, 8192])
+def test_wide_ep_kernel_buffers_stay_under_32bit_addressing(
+    ep_size: int, max_num_batched_tokens: int
+) -> None:
+    """No buffer handed to AITER or the Triton GEMMs reaches 2**32 bytes, however
+    large MoRI's receive capacity (ep_size * max_num_batched_tokens) gets."""
+    hidden, top_k, num_experts, intermediate = 8192, 8, 256, 2048
+    capacity = ep_size * max_num_batched_tokens
+    config = _moe_config(
+        dp_size=ep_size, num_experts=num_experts, top_k=top_k, hidden_size=hidden
+    )
+    limit = 2**32
+    routes_per_token = min(top_k, num_experts // ep_size)
+    chunk_tokens = route_chunk_tokens(routes_per_token * hidden * 2)
+    rows = min(capacity, chunk_tokens) * routes_per_token
+    assert rows * hidden * 2 < limit  # AITER route output (bf16)
+    assert rows * hidden // 2 < limit  # packed MXFP4 route input
+    assert rows * hidden * 2 <= 2**31  # Triton finalize int32 offsets
+
+    norm = _rms_norm_with_input_scale(torch.ones(hidden), 1e-6)
+    experts = _experts(config, norm, "bf16")
+    ws13, ws2, out = experts.workspace_shapes(
+        capacity, 2 * intermediate, hidden, top_k, num_experts,
+        num_experts // ep_size, None, MoEActivation.SILU,
+    )  # fmt: skip
+    assert out == (capacity, hidden)
+    assert (prod(ws13) - prod(out)) * 2 <= 2**31
+    assert prod(ws2) * 2 <= 2**31
+
+
+def test_route_chunk_budget_rejects_oversized_tokens() -> None:
+    with pytest.raises(ValueError, match="per-kernel buffer budget"):
+        route_chunk_tokens(2**31 + 1)
 
 
 def _fake_quark_init(self, moe, weight_quant_key, activation_quant_key) -> None:
@@ -481,3 +554,43 @@ def test_mixed_bf16_and_mxfp4_layers_under_mori(
     assert not _takes_expanded(mxfp4_method)
     mxfp4_method.moe = _moe_config(dp_size=1, use_ep=False)
     assert _takes_expanded(mxfp4_method)
+
+
+requires_gpu = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Triton kernels need a GPU"
+)
+
+
+@requires_gpu
+def test_gather_rows_copies_only_counted_rows() -> None:
+    src = torch.randint(0, 256, (9, 4096), dtype=torch.uint8, device="cuda")
+    index = torch.tensor([4, 0, 8, 4, 1], device="cuda")
+    out = gather_rows(src, index, torch.tensor([3], device="cuda"))
+    torch.testing.assert_close(out[:3], src[index[:3]])
+    cpu = gather_rows(src.cpu(), index.cpu(), torch.tensor([3]))
+    torch.testing.assert_close(out[:3].cpu(), cpu[:3])
+
+
+@requires_gpu
+@pytest.mark.parametrize("hidden", [4096, 8192])
+def test_permuted_finalize_skips_rows_past_num_tokens(hidden: int) -> None:
+    torch.manual_seed(0)
+    tokens, top_k = 6, 8
+    routes = torch.randn(tokens * top_k, hidden, device="cuda", dtype=torch.bfloat16)
+    idx = torch.arange(tokens * top_k, device="cuda", dtype=torch.int32)
+    idx = idx.view(tokens, top_k).contiguous()
+    idx[:, 1::2] = -1
+    weights = torch.rand(tokens, top_k, device="cuda")
+    gain = torch.randn(hidden, device="cuda", dtype=torch.bfloat16) / 10
+    sentinel = torch.full((tokens, hidden), 7.0, device="cuda", dtype=torch.bfloat16)
+    out = sentinel.clone()
+    fused_post_expert_finalize(
+        routes, gain, weights, 1e-6, 1.0, True, out,
+        permuted_idx=idx, num_tokens=torch.tensor([4], device="cuda"),
+    )  # fmt: skip
+    full = sentinel.clone()
+    fused_post_expert_finalize(
+        routes, gain, weights, 1e-6, 1.0, True, full, permuted_idx=idx
+    )
+    torch.testing.assert_close(out[:4], full[:4])
+    torch.testing.assert_close(out[4:], sentinel[4:])

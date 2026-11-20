@@ -4,6 +4,7 @@
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, fields
+from math import prod
 
 import torch
 
@@ -59,6 +60,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.muse_spark.amd.ops.fused_norm_expand import take_expanded
+from vllm.models.muse_spark.amd.ops.gather_rows import gather_rows
 from vllm.models.muse_spark.common.layers import MuseSparkRMSNorm
 from vllm.models.muse_spark.common.moe import (
     MuseSparkConsolidatedRoutedExperts,
@@ -72,6 +74,10 @@ from vllm.models.muse_spark.common.ops.fused_finalize import (
 _FINALIZE_CHUNK_ELEMS = 32 * 1024 * 1024
 # Below this, one custom all-reduce beats the two-RCCL-kernel RS + AG pair.
 _TOKEN_SHARDED_MIN_TOKENS = 256
+# Most bytes a wide-EP MoE chunk hands one kernel buffer: under the 2**32-byte
+# buffer addressing of AITER's FlyDSL MoE, and 2**30 bf16 elements keeps
+# Triton's int32 row offsets in range.
+_ROUTE_CHUNK_BYTES = 2**31
 
 
 def finalizes_before_mori_combine(moe_config: FusedMoEConfig) -> bool:
@@ -279,6 +285,45 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
 
         return output
 
+    def apply_permuted(
+        self,
+        output: torch.Tensor,
+        routes: torch.Tensor,
+        permuted_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_tokens: torch.Tensor,
+    ) -> None:
+        """``output[t] = sum_k w[t, k] * norm(routes[permuted_idx[t, k]])``.
+
+        Routes with ``permuted_idx == -1`` are skipped. Rows from
+        ``num_tokens[0]`` on may be left unwritten.
+        """
+        assert not self.pre_norm_all_reduce
+        norm = self.fused_norm
+        if norm is not None:
+            fused_post_expert_finalize(
+                routes,
+                norm.weight if norm.has_weight else None,
+                topk_weights,
+                norm.variance_epsilon,
+                norm.fused_gain_center,
+                norm.applies_weight_before_norm,
+                output,
+                permuted_idx=permuted_idx,
+                num_tokens=num_tokens,
+            )
+            return
+        rows_total, top_k = permuted_idx.shape
+        chunk_size = self._chunk_size(top_k, routes.shape[-1])
+        for start in range(0, rows_total, chunk_size):
+            end = min(start + chunk_size, rows_total)
+            idx = permuted_idx[start:end]
+            rows = routes[idx.clamp(min=0).long()]
+            rows.masked_fill_((idx < 0).unsqueeze(-1), 0)
+            normalized = self.post_expert_norm_fn(rows, out_dtype=torch.float32)
+            normalized.mul_(topk_weights[start:end].float().unsqueeze(-1))
+            output[start:end].copy_(normalized.sum(dim=1).to(output.dtype))
+
     def _token_sharded_finalize(
         self,
         rows: torch.Tensor,
@@ -315,9 +360,44 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
         out.copy_(gathered[:num_tokens])
 
 
-def _repeat_rows(x: torch.Tensor, repeats: int) -> torch.Tensor:
-    """``x`` with every row repeated ``repeats`` times, copied as raw bytes."""
-    return x.view(torch.uint8).repeat_interleave(repeats, dim=0).view(x.dtype)
+def route_chunk_tokens(bytes_per_token: int) -> int:
+    """Received tokens per chunk whose per-route buffers fit _ROUTE_CHUNK_BYTES."""
+    if bytes_per_token > _ROUTE_CHUNK_BYTES:
+        raise ValueError(
+            f"One token's Muse Spark MoE routes need {bytes_per_token} bytes, "
+            f"above the {_ROUTE_CHUNK_BYTES}-byte per-kernel buffer budget."
+        )
+    return _ROUTE_CHUNK_BYTES // bytes_per_token
+
+
+def compact_local_routes(
+    topk_ids: torch.Tensor,
+    expert_mask: torch.Tensor,
+    num_rows: torch.Tensor,
+    capacity: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pack the local routes of the first ``num_rows`` rows, token-major.
+
+    ``expert_mask`` is AITER's 0/1 local-expert mask with a trailing
+    always-masked slot. Returns, per packed route, its row and expert (the
+    masked slot past the route count), the ``[rows, top_k]`` packed position of
+    every route (-1 when not local), and the route count, all on the device.
+    """
+    num_tokens, top_k = topk_ids.shape
+    received = torch.arange(num_tokens, device=topk_ids.device) < num_rows
+    ids = torch.where(received.unsqueeze(1), topk_ids, -1)
+    local = (ids >= 0) & (expert_mask[ids.clamp(min=0).long()] > 0)
+    flat = local.view(-1)
+    position = torch.cumsum(flat, 0, dtype=torch.int32) - 1
+    num_routes = flat.sum(dtype=torch.int32).view(1)
+    # Non-local routes land in a dropped slot past the capacity.
+    slot = torch.where(flat, position.long(), capacity)
+    route = torch.arange(flat.numel(), device=topk_ids.device)
+    route_token = route.new_zeros(capacity + 1).scatter_(0, slot, route // top_k)
+    route_expert = ids.new_full((capacity + 1,), expert_mask.shape[0] - 1)
+    route_expert.scatter_(0, slot, ids.view(-1))
+    permuted_idx = torch.where(local, position.view(num_tokens, top_k), -1)
+    return route_token[:capacity], route_expert[:capacity], permuted_idx, num_routes
 
 
 def _mask_stale_rows(
@@ -398,7 +478,22 @@ class MuseSparkTritonExperts(_RouteOutputHandoff, TritonExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        workspace13, workspace2, output = super().workspace_shapes(
+        if self._local_finalize is not None:
+            workspace13, workspace2, _ = super().workspace_shapes(
+                min(M, self._chunk_tokens(N, K, topk)),
+                N,
+                K,
+                topk,
+                global_num_experts,
+                local_num_experts,
+                expert_tokens_meta,
+                activation,
+            )
+            # The modular kernel puts workspace13 and the output at the same
+            # address; apply() moves workspace13 past the output so a chunk
+            # cannot overwrite the output rows of the chunks before it.
+            return (M * K + prod(workspace13),), workspace2, (M, K)
+        workspace13, workspace2, _ = super().workspace_shapes(
             M,
             N,
             K,
@@ -408,9 +503,11 @@ class MuseSparkTritonExperts(_RouteOutputHandoff, TritonExperts):
             expert_tokens_meta,
             activation,
         )
-        if self._local_finalize is not None:
-            return workspace13, workspace2, output
         return workspace13, workspace2, (M, topk, K)
+
+    def _chunk_tokens(self, N: int, K: int, topk: int) -> int:
+        """Received tokens per chunk whose Triton workspaces fit the budget."""
+        return route_chunk_tokens(topk * max(N, K) * self.moe_config.in_dtype.itemsize)
 
     def apply(
         self,
@@ -430,31 +527,57 @@ class MuseSparkTritonExperts(_RouteOutputHandoff, TritonExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ) -> None:
-        if self._local_finalize is not None:
-            # Stale MoRI rows become padding (-1) routes the GEMMs skip.
-            assert expert_tokens_meta is not None and expert_map is not None
-            topk_ids = _mask_stale_rows(topk_ids, expert_tokens_meta.expert_num_tokens)
-        super().apply(
-            output,
-            hidden_states,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            activation,
-            global_num_experts,
-            expert_map,
-            a1q_scale,
-            a2_scale,
-            workspace13,
-            workspace2,
-            expert_tokens_meta,
-            apply_router_weight_on_input,
-        )
-        if self._local_finalize is not None:
+        if self._local_finalize is None:
+            super().apply(
+                output,
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                activation,
+                global_num_experts,
+                expert_map,
+                a1q_scale,
+                a2_scale,
+                workspace13,
+                workspace2,
+                expert_tokens_meta,
+                apply_router_weight_on_input,
+            )
+            return
+        assert expert_tokens_meta is not None and expert_map is not None
+        # Stale MoRI rows become padding (-1) routes the GEMMs skip.
+        topk_ids = _mask_stale_rows(topk_ids, expert_tokens_meta.expert_num_tokens)
+        workspace13 = workspace13.flatten()[output.numel() :]
+        num_tokens, top_k = topk_ids.shape
+        chunk_tokens = self._chunk_tokens(w1.shape[1], hidden_states.shape[1], top_k)
+        for start in range(0, num_tokens, chunk_tokens):
+            end = min(start + chunk_tokens, num_tokens)
+            super().apply(
+                output[start:end],
+                hidden_states[start:end],
+                w1,
+                w2,
+                topk_weights[start:end],
+                topk_ids[start:end],
+                activation,
+                global_num_experts,
+                expert_map,
+                None if a1q_scale is None else a1q_scale[start:end],
+                a2_scale,
+                workspace13,
+                workspace2,
+                expert_tokens_meta,
+                apply_router_weight_on_input,
+            )
             # The GEMM2 rows and expert_map parked by _finalize_expert_output.
             self._local_finalize.apply(
-                output, self._route_output, topk_weights, topk_ids, False
+                output[start:end],
+                self._route_output,
+                topk_weights[start:end],
+                topk_ids[start:end],
+                False,
             )
 
     def _apply_router_weight_in_gemm2(self, apply_router_weight_on_input: bool) -> bool:
@@ -539,26 +662,6 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
             else None
         )
 
-    def _finalize_received_routes(
-        self,
-        output: torch.Tensor,
-        route_output: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        expert_mask: torch.Tensor,
-        num_received: torch.Tensor,
-    ) -> None:
-        """Write ``sum_k w_k * norm(route_output[t, k])`` over the local routes.
-
-        ``expert_mask`` is AITER's 0/1 local-expert mask.
-        """
-        assert self._local_finalize is not None
-        local_ids = _mask_stale_rows(topk_ids, num_received)
-        self._park_route_output(route_output, expert_mask.to(torch.int32) - 1)
-        self._local_finalize.apply(
-            output, route_output, topk_weights, local_ids, False
-        )
-
     def _unit_weights(
         self, num_routes: int, width: int, device: torch.device
     ) -> torch.Tensor:
@@ -619,30 +722,39 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
                 "Muse Spark requires router weights after the post-expert norm."
             )
 
+        if self._local_finalize is not None:
+            assert expert_map is not None and expert_tokens_meta is not None
+            self._apply_local_routes(
+                output,
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                activation,
+                expert_map,
+                a1q_scale,
+                expert_tokens_meta.expert_num_tokens,
+            )
+            return
+
         num_tokens, top_k = topk_ids.shape
         hidden_dim = hidden_states.shape[-1]
-        if self._local_finalize is not None:
-            # MoRI hands over packed MXFP4 rows and their scales; repeat both
-            # bytewise, one row per route.
-            expanded_hidden_states = _repeat_rows(hidden_states, top_k)
-            if a1q_scale is not None:
-                a1q_scale = _repeat_rows(a1q_scale, top_k)
-        else:
-            expected_output_shape = (num_tokens, top_k, hidden_dim)
-            if output.shape != expected_output_shape:
-                raise ValueError(
-                    "Muse Spark AITER output has shape "
-                    f"{tuple(output.shape)}, expected {expected_output_shape}."
-                )
+        expected_output_shape = (num_tokens, top_k, hidden_dim)
+        if output.shape != expected_output_shape:
+            raise ValueError(
+                "Muse Spark AITER output has shape "
+                f"{tuple(output.shape)}, expected {expected_output_shape}."
+            )
 
-            expanded_hidden_states = take_expanded(hidden_states, top_k)
-            if expanded_hidden_states is None:
-                expanded_hidden_states = (
-                    hidden_states[:, None, :]
-                    .expand(num_tokens, top_k, hidden_dim)
-                    .reshape(num_tokens * top_k, hidden_dim)
-                    .contiguous()
-                )
+        expanded_hidden_states = take_expanded(hidden_states, top_k)
+        if expanded_hidden_states is None:
+            expanded_hidden_states = (
+                hidden_states[:, None, :]
+                .expand(num_tokens, top_k, hidden_dim)
+                .reshape(num_tokens * top_k, hidden_dim)
+                .contiguous()
+            )
         # Only the shape of topk_ids is read after the experts.
         num_routes = num_tokens * top_k
         flat_topk_ids = topk_ids.view(num_routes, 1)
@@ -661,9 +773,6 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
             num_local_tokens = expert_tokens_meta.expert_num_tokens
         else:
             num_local_tokens = None
-        num_received = num_local_tokens
-        if self._local_finalize is not None and num_local_tokens is not None:
-            num_local_tokens = num_local_tokens * top_k
 
         route_output = rocm_aiter_fused_experts(
             hidden_states=expanded_hidden_states,
@@ -683,18 +792,79 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
             apply_router_weight_on_input=False,
             **self._extra_fused_moe_kwargs(),
         )
-        if self._local_finalize is None:
-            self._park_route_output(route_output.view_as(output))
-            return
-        assert expert_map is not None and num_received is not None
-        self._finalize_received_routes(
-            output,
-            route_output.view(num_tokens, top_k, output.shape[-1]),
-            topk_weights,
-            topk_ids,
-            expert_map,
-            num_received,
+        self._park_route_output(route_output.view_as(output))
+
+    def _apply_local_routes(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        expert_mask: torch.Tensor,
+        a1q_scale: torch.Tensor | None,
+        num_received: torch.Tensor,
+    ) -> None:
+        """Finalize this rank's routes of MoRI's received tokens into ``output``.
+
+        Received tokens are taken in chunks; each chunk's local routes are
+        compacted into one AITER row each, so the expert work follows the
+        received local routes and no AITER buffer exceeds _ROUTE_CHUNK_BYTES.
+        """
+        assert self._local_finalize is not None
+        num_tokens, top_k = topk_ids.shape
+        routes_per_token = min(top_k, self.moe_config.num_local_experts)
+        chunk_tokens = route_chunk_tokens(
+            routes_per_token * output.shape[-1] * output.element_size()
         )
+        masked_expert = expert_mask.shape[0] - 1
+        for start in range(0, num_tokens, chunk_tokens):
+            end = min(start + chunk_tokens, num_tokens)
+            num_rows = (num_received - start).clamp(0, end - start)
+            capacity = (end - start) * routes_per_token
+            route_token, route_expert, permuted_idx, num_routes = (
+                compact_local_routes(
+                    topk_ids[start:end], expert_mask, num_rows, capacity
+                )
+            )
+            # AITER's EP convention: one extra route per row on the
+            # always-masked last expert_mask slot.
+            flat_topk_ids = torch.stack(
+                (route_expert, torch.full_like(route_expert, masked_expert)), dim=1
+            )
+            route_output = rocm_aiter_fused_experts(
+                hidden_states=gather_rows(
+                    hidden_states[start:end], route_token, num_routes
+                ),
+                w1=w1,
+                w2=w2,
+                topk_weights=self._unit_weights(capacity, 2, topk_ids.device),
+                topk_ids=flat_topk_ids,
+                activation=activation,
+                expert_mask=expert_mask,
+                quant_config=self.quant_config,
+                quant_type=self._AITER_QUANT_TYPE,
+                moe_config=self.moe_config,
+                a1q_scale=(
+                    None
+                    if a1q_scale is None
+                    else gather_rows(a1q_scale[start:end], route_token, num_routes)
+                ),
+                num_local_tokens=num_routes,
+                output_dtype=output.dtype,
+                moe_sorting_dispatch_policy=rocm_aiter_ops.get_moe_dispatch_policy(),
+                apply_router_weight_on_input=False,
+                **self._extra_fused_moe_kwargs(),
+            )
+            self._local_finalize.apply_permuted(
+                output[start:end],
+                route_output,
+                permuted_idx,
+                topk_weights[start:end],
+                num_rows,
+            )
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         if self._local_finalize is not None:

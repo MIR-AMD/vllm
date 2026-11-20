@@ -20,6 +20,8 @@ def _post_expert_finalize_kernel(
     idx_ptr,
     PERMUTED: tl.constexpr,
     stride_idx,
+    num_tokens_ptr,
+    HAS_NUM_TOKENS: tl.constexpr,
     K,
     H,
     eps,
@@ -34,6 +36,9 @@ def _post_expert_finalize_kernel(
     WEIGHT_FIRST: tl.constexpr,
 ):
     t = tl.program_id(0)
+    if HAS_NUM_TOKENS:
+        if t >= tl.load(num_tokens_ptr):
+            return
     k = tl.arange(0, BLOCK_K)
     offs = tl.arange(0, BLOCK_H)
     k_mask = k < K
@@ -82,6 +87,8 @@ def _post_expert_finalize_loop_kernel(
     idx_ptr,
     PERMUTED: tl.constexpr,
     stride_idx,
+    num_tokens_ptr,
+    HAS_NUM_TOKENS: tl.constexpr,
     K,
     H,
     eps,
@@ -95,6 +102,9 @@ def _post_expert_finalize_loop_kernel(
     WEIGHT_FIRST: tl.constexpr,
 ):
     t = tl.program_id(0)
+    if HAS_NUM_TOKENS:
+        if t >= tl.load(num_tokens_ptr):
+            return
     offs = tl.arange(0, BLOCK_H)
     mask = offs < H
     if HAS_WEIGHT:
@@ -138,11 +148,14 @@ def fused_post_expert_finalize(
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     permuted_idx: torch.Tensor | None = None,
+    num_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``out[t] = sum_k tw[t, k] * norm(routed[t, k])`` written in ``out.dtype``.
 
     Routes with a negative ``expert_map`` entry or ``permuted_idx == -1`` were
-    never written and are masked before the read.
+    never written and are masked before the read. With ``num_tokens`` (a
+    one-element device tensor), rows from ``num_tokens[0]`` on are left
+    unwritten.
     """
     if expert_map is not None:
         assert topk_ids is not None and topk_ids.stride(1) == 1
@@ -179,6 +192,8 @@ def fused_post_expert_finalize(
         permuted_idx if permuted_idx is not None else topk_weights,
         permuted_idx is not None,
         permuted_idx.stride(0) if permuted_idx is not None else 0,
+        num_tokens if num_tokens is not None else topk_weights,
+        num_tokens is not None,
         K,
         H,
         eps,
