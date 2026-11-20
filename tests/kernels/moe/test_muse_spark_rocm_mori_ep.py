@@ -10,6 +10,8 @@ own routes: ``sum_k w_k * norm(out_k)`` over its local experts.
 from collections.abc import Callable
 from dataclasses import fields
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -23,13 +25,27 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
+from vllm.model_executor.layers.quantization.quark.quark_moe import (
+    QuarkOCP_MX_MoEMethod,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kMxfp4Dynamic,
+    kMxfp4Static,
+)
+from vllm.models.muse_spark.amd.model import MuseSparkMoE
 from vllm.models.muse_spark.amd.muse_moe_runner import (
     MuseSparkAiterExperts,
+    MuseSparkQuarkOCPMXFusedMoE,
     MuseSparkQuarkOCPMXMoEQuantConfig,
     MuseSparkTopKWeightAndReduce,
+    MuseSparkTritonExperts,
+    MuseSparkUnquantizedFusedMoE,
+    MuseSparkUnquantizedMoEQuantConfig,
     finalizes_before_mori_combine,
     validate_bf16_deployment,
     validate_fp8_deployment,
@@ -56,6 +72,7 @@ def _moe_config(
     num_experts: int = 16,
     top_k: int = 4,
     hidden_size: int = 64,
+    moe_backend: str = "triton",
 ) -> FusedMoEConfig:
     # As FusedMoEParallelConfig.make: under EP the attention TP folds into EP.
     ep_size = tp_size * dp_size * pcp_size if use_ep else 1
@@ -86,7 +103,7 @@ def _moe_config(
         routing_method=RoutingMethodType.Custom,
         moe_parallel_config=parallel_config,
         in_dtype=torch.bfloat16,
-        moe_backend="triton",
+        moe_backend=moe_backend,
     )
 
 
@@ -95,10 +112,12 @@ def _moe_config(
     "backend", ["mori_high_throughput", "mori_low_latency", "mori"]
 )
 @pytest.mark.parametrize("dp_size", [8, 16, 32])
-def test_mxfp4_accepts_tp1_dp_ep_mori(backend: str, dp_size: int) -> None:
+def test_mxfp4_and_bf16_accept_tp1_dp_ep_mori(backend: str, dp_size: int) -> None:
     config = _moe_config(dp_size=dp_size, all2all_backend=backend, num_experts=128)
     assert finalizes_before_mori_combine(config)
     validate_mxfp4_deployment(config)
+    # Muse Spark's first and last MoE layers stay BF16 in the MXFP4 checkpoint.
+    validate_bf16_deployment(config)
 
 
 @pytest.mark.parametrize(
@@ -117,20 +136,26 @@ def test_mxfp4_accepts_tp1_dp_ep_mori(backend: str, dp_size: int) -> None:
         ({"enable_eplb": True}, "EPLB"),
     ],
 )
-def test_mxfp4_rejects_other_dp_deployments(kwargs: dict, reason: str) -> None:
+@pytest.mark.parametrize(
+    "validate", [validate_mxfp4_deployment, validate_bf16_deployment]
+)
+def test_other_dp_deployments_are_rejected(
+    validate: Callable[[FusedMoEConfig], None], kwargs: dict, reason: str
+) -> None:
     config = _moe_config(**kwargs)
     with pytest.raises(NotImplementedError, match=reason):
-        validate_mxfp4_deployment(config)
+        validate(config)
 
 
-@pytest.mark.parametrize(
-    "validate", [validate_bf16_deployment, validate_fp8_deployment]
-)
-def test_bf16_and_fp8_still_require_dp1(
-    validate: Callable[[FusedMoEConfig], None],
-) -> None:
+def test_fp8_still_requires_dp1() -> None:
     with pytest.raises(NotImplementedError, match="DP1"):
-        validate(_moe_config())
+        validate_fp8_deployment(_moe_config())
+
+
+@pytest.mark.parametrize("moe_backend", ["aiter", "flashinfer_trtllm"])
+def test_bf16_under_mori_still_requires_the_triton_backend(moe_backend: str) -> None:
+    with pytest.raises(NotImplementedError, match="Triton"):
+        validate_bf16_deployment(_moe_config(moe_backend=moe_backend))
 
 
 def _rms_norm_with_input_scale(
@@ -146,8 +171,14 @@ def _rms_norm_with_input_scale(
     return norm
 
 
-def _experts(config: FusedMoEConfig, norm_fn) -> MuseSparkAiterExperts:
-    quant_config = MuseSparkQuarkOCPMXMoEQuantConfig(
+def _experts(
+    config: FusedMoEConfig, norm_fn, backend: str = "mxfp4"
+) -> MuseSparkAiterExperts | MuseSparkTritonExperts:
+    config_cls, experts_cls = {
+        "mxfp4": (MuseSparkQuarkOCPMXMoEQuantConfig, MuseSparkAiterExperts),
+        "bf16": (MuseSparkUnquantizedMoEQuantConfig, MuseSparkTritonExperts),
+    }[backend]
+    quant_config = config_cls(
         **{
             f.name: getattr(FUSED_MOE_UNQUANTIZED_CONFIG, f.name)
             for f in fields(FusedMoEQuantConfig)
@@ -155,12 +186,15 @@ def _experts(config: FusedMoEConfig, norm_fn) -> MuseSparkAiterExperts:
         },
         post_expert_norm_fn=norm_fn,
     )
-    return MuseSparkAiterExperts(config, quant_config)
+    return experts_cls(config, quant_config)
 
 
-def test_dp1_experts_keep_the_route_major_finalize() -> None:
+@pytest.mark.parametrize("backend", ["mxfp4", "bf16"])
+def test_dp1_experts_keep_the_route_major_finalize(backend: str) -> None:
     config = _moe_config(dp_size=1, use_ep=False)
-    experts = _experts(config, _rms_norm_with_input_scale(torch.ones(64), 1e-6))
+    experts = _experts(
+        config, _rms_norm_with_input_scale(torch.ones(64), 1e-6), backend
+    )
     assert experts._local_finalize is None
     shapes = experts.workspace_shapes(
         5, 128, 64, 4, 16, 16, None, MoEActivation.SILU
@@ -180,9 +214,13 @@ def _simulate_mori_ep(
     hidden: int,
     tokens_per_rank: int,
     seed: int,
+    backend: str,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Run MuseSparkAiterExperts.apply on every simulated EP rank behind a
-    MoRI-style dispatch/combine. Returns (combined, reference) per source rank."""
+    """Run the Muse experts' apply on every simulated EP rank behind a
+    MoRI-style dispatch/combine. Returns (combined, reference) per source rank.
+
+    ``mxfp4`` runs MuseSparkAiterExperts with AITER faked; ``bf16`` runs
+    MuseSparkTritonExperts with the stock Triton GEMMs faked."""
     gen = torch.Generator().manual_seed(seed)
     local = num_experts // ep_size
     eps = 1e-6
@@ -248,6 +286,24 @@ def _simulate_mori_ep(
         _fake_aiter,
     )
 
+    def _fake_triton_apply(
+        self, output, hidden_states, w1, w2, topk_weights, topk_ids, activation,
+        global_num_experts, expert_map, a1q_scale, a2_scale, workspace13,
+        workspace2, expert_tokens_meta, apply_router_weight_on_input,
+    ) -> None:  # fmt: skip
+        assert not self._apply_router_weight_in_gemm2(apply_router_weight_on_input)
+        assert output.shape == hidden_states.shape
+        calls.append({"topk_ids": topk_ids.clone(), "a1q_scale": a1q_scale})
+        # GEMM2 rows of skipped routes (remote, padding) are never written.
+        rows = torch.full((*topk_ids.shape, hidden), float("nan"))
+        for i, k in (topk_ids >= 0).nonzero().tolist():
+            e = int(topk_ids[i, k])
+            if expert_map[e] >= 0:
+                rows[i, k] = hidden_states[i].float() @ expert_w[e]
+        self._finalize_expert_output(rows, output, topk_ids, expert_map)
+
+    monkeypatch.setattr(TritonExperts, "apply", _fake_triton_apply)
+
     config = _moe_config(
         dp_size=ep_size, num_experts=num_experts, top_k=top_k, hidden_size=hidden
     )
@@ -267,15 +323,25 @@ def _simulate_mori_ep(
             10**6, 2 * 10**6, (capacity, top_k), generator=gen, dtype=torch.int32
         )
         recv_w = torch.rand(capacity, top_k, generator=gen)
-        recv_scale = torch.randint(
-            0, 256, (capacity, hidden // 32), generator=gen, dtype=torch.uint8
+        # BF16 layers dispatch unquantized rows without scales.
+        recv_scale = (
+            torch.randint(
+                0, 256, (capacity, hidden // 32), generator=gen, dtype=torch.uint8
+            )
+            if backend == "mxfp4"
+            else None
         )
         for j, (s, t) in enumerate(received):
             recv_x[j], recv_ids[j], recv_w[j] = x[s][t], ids[s][t], w[s][t]
-        expert_mask = torch.zeros(num_experts + 1, dtype=torch.int32)
-        expert_mask[list(owned)] = 1
+        if backend == "mxfp4":
+            # AITER takes a 0/1 mask with a trailing always-masked slot.
+            expert_map = torch.zeros(num_experts + 1, dtype=torch.int32)
+            expert_map[list(owned)] = 1
+        else:
+            expert_map = torch.full((num_experts,), -1, dtype=torch.int32)
+            expert_map[list(owned)] = torch.arange(local, dtype=torch.int32)
 
-        experts = _experts(config, norm_fn)
+        experts = _experts(config, norm_fn, backend)
         experts._extra_fused_moe_kwargs = lambda: {}  # type: ignore[method-assign]
         assert experts._local_finalize is not None
         assert isinstance(
@@ -302,7 +368,7 @@ def _simulate_mori_ep(
             recv_ids,
             MoEActivation.SILU,
             num_experts,
-            expert_mask,
+            expert_map,
             recv_scale,
             None,
             torch.empty(0),
@@ -314,13 +380,19 @@ def _simulate_mori_ep(
             False,
         )
         call = calls[-1]
-        torch.testing.assert_close(
-            call["hidden_states"], recv_x.repeat_interleave(top_k, dim=0)
-        )
-        torch.testing.assert_close(
-            call["a1q_scale"], recv_scale.repeat_interleave(top_k, dim=0)
-        )
-        assert int(call["num_local_tokens"]) == n * top_k
+        if backend == "mxfp4":
+            torch.testing.assert_close(
+                call["hidden_states"], recv_x.repeat_interleave(top_k, dim=0)
+            )
+            torch.testing.assert_close(
+                call["a1q_scale"], recv_scale.repeat_interleave(top_k, dim=0)
+            )
+            assert int(call["num_local_tokens"]) == n * top_k
+        else:
+            # Stale rows reach the Triton GEMMs only as padding routes.
+            assert bool((call["topk_ids"][n:] == -1).all())
+            torch.testing.assert_close(call["topk_ids"][:n], recv_ids[:n])
+            assert call["a1q_scale"] is None
         assert experts._take_route_output() is None
         # Every row, including the stale tail, is finite.
         assert bool(torch.isfinite(output).all())
@@ -330,11 +402,16 @@ def _simulate_mori_ep(
     return combined, reference
 
 
+@pytest.mark.parametrize("backend", ["mxfp4", "bf16"])
 @pytest.mark.parametrize(
     "ep_size,num_experts,top_k", [(2, 8, 2), (4, 16, 4), (8, 64, 6)]
 )
 def test_ep_rank_partials_sum_to_the_dp1_output(
-    monkeypatch: pytest.MonkeyPatch, ep_size: int, num_experts: int, top_k: int
+    monkeypatch: pytest.MonkeyPatch,
+    ep_size: int,
+    num_experts: int,
+    top_k: int,
+    backend: str,
 ) -> None:
     combined, reference = _simulate_mori_ep(
         monkeypatch,
@@ -344,6 +421,63 @@ def test_ep_rank_partials_sum_to_the_dp1_output(
         hidden=64,
         tokens_per_rank=5,
         seed=ep_size,
+        backend=backend,
     )
     for got, ref in zip(combined, reference):
         torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-5)
+
+
+def _fake_quark_init(self, moe, weight_quant_key, activation_quant_key) -> None:
+    self.moe = moe
+    self.ocp_mx_scheme = "w_mxfp4_a_mxfp4"
+    self.mxfp4_backend = Mxfp4MoeBackend.AITER_MXFP4_MXFP4
+    self.experts_cls = None
+
+
+def test_mixed_bf16_and_mxfp4_methods_construct_under_mori(
+    monkeypatch: pytest.MonkeyPatch, default_vllm_config
+) -> None:
+    """Layers 0 and 61 are BF16 (Triton), the rest MXFP4 (AITER)."""
+    monkeypatch.setattr(QuarkOCP_MX_MoEMethod, "__init__", _fake_quark_init)
+    mori = _moe_config(dp_size=8, num_experts=128)
+    bf16_method = MuseSparkUnquantizedFusedMoE(mori)
+    mxfp4_method = MuseSparkQuarkOCPMXFusedMoE(mori, kMxfp4Static, kMxfp4Dynamic)
+    assert bf16_method.experts_cls is MuseSparkTritonExperts
+    assert mxfp4_method.experts_cls is MuseSparkAiterExperts
+
+
+def test_mixed_bf16_and_mxfp4_layers_under_mori(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both expert kinds finalize their local routes, and only MXFP4 expands
+    its input per route -- after dispatch, never before it."""
+    mori = _moe_config(dp_size=8, num_experts=128)
+    norm = _rms_norm_with_input_scale(torch.ones(64), 1e-6)
+    for backend in ("bf16", "mxfp4"):
+        experts = _experts(mori, norm, backend)
+        assert experts._local_finalize is not None
+        assert isinstance(
+            experts.finalize_weight_and_reduce_impl(), TopKWeightAndReduceNoOP
+        )
+        shapes = experts.workspace_shapes(
+            7, 128, 64, 4, 128, 16, None, MoEActivation.SILU
+        )
+        assert shapes[2] == (7, 64)
+
+    def _takes_expanded(method) -> bool:
+        moe = SimpleNamespace(
+            pre_expert_norm=SimpleNamespace(variance_size_override=None),
+            experts=SimpleNamespace(
+                routed_experts=SimpleNamespace(quant_method=method)
+            ),
+        )
+        return MuseSparkMoE._experts_take_expanded_input.func(moe)
+
+    bf16_method = MuseSparkUnquantizedFusedMoE.__new__(MuseSparkUnquantizedFusedMoE)
+    bf16_method.moe = mori
+    mxfp4_method = MuseSparkQuarkOCPMXFusedMoE.__new__(MuseSparkQuarkOCPMXFusedMoE)
+    mxfp4_method.moe = mori
+    assert not _takes_expanded(bf16_method)
+    assert not _takes_expanded(mxfp4_method)
+    mxfp4_method.moe = _moe_config(dp_size=1, use_ep=False)
+    assert _takes_expanded(mxfp4_method)

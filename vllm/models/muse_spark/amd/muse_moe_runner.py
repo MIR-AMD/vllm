@@ -122,7 +122,7 @@ def _validate_tp_post_norm_deployment(
 
 def validate_bf16_deployment(moe_config: FusedMoEConfig) -> None:
     """Reject deployments whose BF16 finalization is not implemented."""
-    _validate_tp_post_norm_deployment(moe_config, "BF16")
+    _validate_tp_post_norm_deployment(moe_config, "BF16", allow_mori_ep=True)
     if moe_config.moe_backend not in ("auto", "triton"):
         raise NotImplementedError(
             "Muse Spark BF16 on ROCm requires the Triton MoE backend; got "
@@ -235,7 +235,9 @@ class MuseSparkTopKWeightAndReduce(mk.TopKWeightAndReduce):
             self.pre_norm_all_reduce or self.fused_norm is None
         ):
             # Only the fused finalize masks unwritten non-local routes itself.
-            routed.masked_fill_((expert_map[topk_ids.long()] < 0).unsqueeze(-1), 0)
+            # -1 ids (MoRI padding) would wrap to the last expert's entry.
+            local = (topk_ids >= 0) & (expert_map[topk_ids.long()] >= 0)
+            routed.masked_fill_(~local.unsqueeze(-1), 0)
             expert_map = None
 
         chunk_size = self._chunk_size(top_k, hidden_dim)
@@ -318,6 +320,18 @@ def _repeat_rows(x: torch.Tensor, repeats: int) -> torch.Tensor:
     return x.view(torch.uint8).repeat_interleave(repeats, dim=0).view(x.dtype)
 
 
+def _mask_stale_rows(
+    topk_ids: torch.Tensor, num_received: torch.Tensor
+) -> torch.Tensor:
+    """``topk_ids`` with rows from ``num_received`` on set to -1.
+
+    MoRI reuses capacity-sized receive buffers without clearing them; the stale
+    rows combine never reads may hold garbage ids.
+    """
+    received = torch.arange(topk_ids.shape[0], device=topk_ids.device) < num_received
+    return torch.where(received.unsqueeze(1), topk_ids, -1)
+
+
 class _RouteOutputHandoff:
     """Hand the experts' per-route buffer to the finalize instead of copying it."""
 
@@ -338,6 +352,16 @@ class _RouteOutputHandoff:
         expert_map, self._route_expert_map = self._route_expert_map, None
         return expert_map
 
+    def _make_local_finalize(
+        self, post_expert_norm_fn: Callable[..., torch.Tensor]
+    ) -> MuseSparkTopKWeightAndReduce:
+        return MuseSparkTopKWeightAndReduce(
+            post_expert_norm_fn,
+            pre_norm_all_reduce=False,
+            take_route_output=self._take_route_output,
+            take_route_expert_map=self._take_route_expert_map,
+        )
+
 
 class MuseSparkTritonExperts(_RouteOutputHandoff, TritonExperts):
     """Triton experts that expose unweighted GEMM2 output per route."""
@@ -357,6 +381,11 @@ class MuseSparkTritonExperts(_RouteOutputHandoff, TritonExperts):
             )
         if quant_config.post_expert_norm_fn is None:
             raise ValueError("Muse Spark post-expert norm is not configured.")
+        self._local_finalize = (
+            self._make_local_finalize(quant_config.post_expert_norm_fn)
+            if finalizes_before_mori_combine(moe_config)
+            else None
+        )
 
     def workspace_shapes(
         self,
@@ -369,7 +398,7 @@ class MuseSparkTritonExperts(_RouteOutputHandoff, TritonExperts):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        workspace13, workspace2, _ = super().workspace_shapes(
+        workspace13, workspace2, output = super().workspace_shapes(
             M,
             N,
             K,
@@ -379,7 +408,54 @@ class MuseSparkTritonExperts(_RouteOutputHandoff, TritonExperts):
             expert_tokens_meta,
             activation,
         )
+        if self._local_finalize is not None:
+            return workspace13, workspace2, output
         return workspace13, workspace2, (M, topk, K)
+
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        if self._local_finalize is not None:
+            # Stale MoRI rows become padding (-1) routes the GEMMs skip.
+            assert expert_tokens_meta is not None and expert_map is not None
+            topk_ids = _mask_stale_rows(topk_ids, expert_tokens_meta.expert_num_tokens)
+        super().apply(
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation,
+            global_num_experts,
+            expert_map,
+            a1q_scale,
+            a2_scale,
+            workspace13,
+            workspace2,
+            expert_tokens_meta,
+            apply_router_weight_on_input,
+        )
+        if self._local_finalize is not None:
+            # The GEMM2 rows and expert_map parked by _finalize_expert_output.
+            self._local_finalize.apply(
+                output, self._route_output, topk_weights, topk_ids, False
+            )
 
     def _apply_router_weight_in_gemm2(self, apply_router_weight_on_input: bool) -> bool:
         if apply_router_weight_on_input:
@@ -399,6 +475,9 @@ class MuseSparkTritonExperts(_RouteOutputHandoff, TritonExperts):
         self._park_route_output(expert_output, expert_map)
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+        if self._local_finalize is not None:
+            # The combine sums the rows apply() already finalized.
+            return TopKWeightAndReduceNoOP()
         quant_config = self.quant_config
         assert isinstance(
             quant_config,
@@ -460,16 +539,6 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
             else None
         )
 
-    def _make_local_finalize(
-        self, post_expert_norm_fn: Callable[..., torch.Tensor]
-    ) -> MuseSparkTopKWeightAndReduce:
-        return MuseSparkTopKWeightAndReduce(
-            post_expert_norm_fn,
-            pre_norm_all_reduce=False,
-            take_route_output=self._take_route_output,
-            take_route_expert_map=self._take_route_expert_map,
-        )
-
     def _finalize_received_routes(
         self,
         output: torch.Tensor,
@@ -481,15 +550,10 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
     ) -> None:
         """Write ``sum_k w_k * norm(route_output[t, k])`` over the local routes.
 
-        ``expert_mask`` is AITER's 0/1 local-expert mask. Rows from
-        ``num_received`` on are stale MoRI buffer rows that combine never reads;
-        their ids may be garbage, so they are masked as well.
+        ``expert_mask`` is AITER's 0/1 local-expert mask.
         """
         assert self._local_finalize is not None
-        received = (
-            torch.arange(topk_ids.shape[0], device=topk_ids.device) < num_received
-        )
-        local_ids = torch.where(received.unsqueeze(1), topk_ids, -1)
+        local_ids = _mask_stale_rows(topk_ids, num_received)
         self._park_route_output(route_output, expert_mask.to(torch.int32) - 1)
         self._local_finalize.apply(
             output, route_output, topk_weights, local_ids, False
